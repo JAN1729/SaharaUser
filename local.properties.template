@@ -1,0 +1,51 @@
+# ===========================================
+# SaharaUser - SECURE Configuration Template
+# ===========================================
+# 
+# SETUP INSTRUCTIONS:
+# 1. Copy this file to 'local.properties' in the same directory
+# 2. Replace placeholder values with your actual keys
+# 3. NEVER commit local.properties to git (it's in .gitignore)
+#
+# ===========================================
+
+# -----------------------------------------
+# PERPLEXITY API KEY (REQUIRED)
+# -----------------------------------------
+# Get your key from: https://www.perplexity.ai/settings/api
+# Format: pplx-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+#
+PERPLEXITY_API_KEY=pplx-YOUR-API-KEY-HERE
+
+# -----------------------------------------
+# SUPABASE CONFIGURATION (REQUIRED)
+# -----------------------------------------
+# Get these from your Supabase project settings:
+# Dashboard → Settings → API
+#
+# Project URL (format: https://xxxxx.supabase.co)
+SUPABASE_URL=https://YOUR-PROJECT-ID.supabase.co
+
+# Anon/Public Key (safe for client-side, RLS protected)
+SUPABASE_ANON_KEY=YOUR-SUPABASE-ANON-KEY
+
+# -----------------------------------------
+# SECURITY NOTES
+# -----------------------------------------
+# 
+# 1. The SUPABASE_ANON_KEY is designed to be used client-side
+#    and is protected by Row Level Security (RLS) policies.
+#    
+# 2. NEVER use the service_role key in a mobile app!
+#
+# 3. For the AI read-only agent, consider creating a custom
+#    Supabase role with limited SELECT-only permissions.
+#
+# 4. Rotate API keys periodically.
+#
+# 5. Monitor usage in Perplexity and Supabase dashboards.
+#
+# ===========================================
+
+# Android SDK location (auto-set by Android Studio)
+# sdk.dir=C\:\\Users\\YourName\\AppData\\Local\\Android\\Sdk

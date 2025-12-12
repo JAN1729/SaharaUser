@@ -1,0 +1,64 @@
+# ===========================================
+# ANDROID GITIGNORE - SECURITY FOCUSED
+# ===========================================
+
+# Gradle
+.gradle/
+build/
+/captures
+
+# IDE
+/.idea
+*.iml
+.DS_Store
+*.hprof
+
+# External Native Builds
+.externalNativeBuild
+.cxx
+
+# ===========================================
+# SECURITY - NEVER COMMIT THESE FILES
+# ===========================================
+
+# API Keys and Secrets
+
+local.properties
+
+*.env
+.env
+.env.local
+.env.*
+secrets.properties
+api-keys.properties
+
+# Keystore files (signing keys)
+*.jks
+*.keystore
+keystore.properties
+
+# Service account files
+*.json
+!package.json
+google-services.json
+
+# ===========================================
+# BUILD ARTIFACTS
+# ===========================================
+
+# APK and Bundle outputs (contain embedded keys)
+*.apk
+*.aab
+*.ap_
+
+# Debug files
+*.dex
+*.class
+
+# Log files
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+*.bak

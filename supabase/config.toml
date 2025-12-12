@@ -1,0 +1,10 @@
+[project]
+id = "sahara-user"
+name = "SaharaUser Multi-Agent System"
+
+[api]
+enabled = true
+port = 54321
+
+[functions]
+verify_jwt = true
