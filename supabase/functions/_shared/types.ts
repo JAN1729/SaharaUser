@@ -42,6 +42,9 @@ export interface LiveLocation {
 // AGENT SYSTEM TYPES
 // ============================================================================
 
+// Import hub interface (avoid circular dependency by using import type)
+import type { IAgentCommunicationHub } from './agent-communication-hub.ts';
+
 export interface AgentContext {
   taskId: string;
   userId: string;
@@ -51,6 +54,8 @@ export interface AgentContext {
   agentResults: Map<string, AgentOutput>;
   executionTrace: TraceEvent[];
   startTime: number;
+  /** Agent Communication Hub for inter-agent messaging */
+  hub?: IAgentCommunicationHub;
 }
 
 export interface AgentInput {
@@ -78,7 +83,7 @@ export interface TraceEvent {
   timestamp: number;
 }
 
-export type TraceEventType = 
+export type TraceEventType =
   | 'AGENT_STARTED'
   | 'AGENT_COMPLETED'
   | 'TOOL_STARTED'
@@ -112,7 +117,7 @@ export interface ToolResult {
 // QUERY PARSING TYPES
 // ============================================================================
 
-export type QueryIntent = 
+export type QueryIntent =
   | 'FIND_ROUTE'
   | 'FIND_BEST_OPTION'
   | 'TRACK_BUS'
@@ -190,6 +195,7 @@ export interface TrackBusResponse {
   nearestStopDistance: number;
   freshness: 'fresh' | 'recent' | 'stale';
   timestamp: string;
+  message?: string;  // AI-generated human-readable status
   error?: string;
 }
 
@@ -210,6 +216,7 @@ export interface NearbyStopsResponse {
     vehicleName: string;
   }>;
   count: number;
+  message?: string;  // AI-generated human-readable summary
 }
 
 // ============================================================================

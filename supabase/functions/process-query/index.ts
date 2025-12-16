@@ -1,18 +1,167 @@
 /**
- * Process Query Edge Function - ENHANCED with LLM Multi-Agent Framework
+ * Process Query Edge Function - SIMPLIFIED 5-Layer Filtering Pipeline
  * 
- * This is the main entry point for the Sahara Bus AI agent system.
- * Features:
- * - LLM-powered intent analysis (Groq API)
- * - Parallel agent execution
- * - Result validation and synthesis
- * - Deterministic fallback when LLM fails
+ * Architecture: 6 Core Agents with Layered Filtering
+ * 1. IntentAgent - AI-driven query analysis with subdividing
+ * 2. DataAgent - Fetch LATEST data only (optimized)
+ * 3. MemoryAgent - RAG context retrieval
+ * 4. RouteAgent - Path finding + ETA (merged PathAgent + TimeAgent)
+ * 5. TrackerAgent - Bus tracking
+ * 6. GeocodingAgent - Place name enrichment
  * 
- * Paste this ENTIRE file into the Supabase Dashboard.
+ * Filtering Pipeline:
+ * Layer 1: AI Intent Analysis → subdivide user query
+ * Layer 2: Location Filter → 3km radius from user's LATEST location
+ * Layer 3: Nearest Stop Selection → KNN + alternatives
+ * Layer 4: Bus Filtering → LATEST coordinates only
+ * Layer 5: AI Response → Grounded, no hallucination
  */
 
 import { serve } from 'https://deno.land/std@0.168.0/http/server.ts';
 import { createClient, SupabaseClient } from 'https://esm.sh/@supabase/supabase-js@2';
+
+// ============================================================================
+// INLINE DEFINITIONS (avoiding _shared/ import issues with Supabase bundler)
+// ============================================================================
+
+// Minimal communication hub stub (full implementation not needed for core functionality)
+interface IAgentCommunicationHub {
+    publish: (msg: Record<string, unknown>) => void;
+    reset: () => void;
+}
+function createCommunicationHub(): IAgentCommunicationHub {
+    return {
+        publish: () => { },
+        reset: () => { }
+    };
+}
+
+// Message types for agent communication (inlined from agent-communication-hub.ts)
+enum MessageType {
+    DATA_READY = 'DATA_READY',
+    DATA_UPDATED = 'DATA_UPDATED',
+    INTENT_ANALYZED = 'INTENT_ANALYZED',
+    ROUTE_FOUND = 'ROUTE_FOUND',
+    ROUTE_NOT_FOUND = 'ROUTE_NOT_FOUND',
+    LOCATION_UPDATE = 'LOCATION_UPDATE',
+    BUS_TRACKED = 'BUS_TRACKED',
+    MEMORY_RETRIEVED = 'MEMORY_RETRIEVED',
+    PLACE_GEOCODED = 'PLACE_GEOCODED',
+    WALKING_DIRECTIONS_READY = 'WALKING_DIRECTIONS_READY',
+    REQUEST = 'REQUEST',
+    RESPONSE = 'RESPONSE',
+    ERROR = 'ERROR',
+    AGENT_STARTED = 'AGENT_STARTED',
+    AGENT_COMPLETED = 'AGENT_COMPLETED'
+}
+
+enum MessagePriority {
+    CRITICAL = 1,
+    HIGH = 2,
+    NORMAL = 3,
+    LOW = 4
+}
+
+// Intent router types and functions (inlined from intent-router.ts)
+enum EndpointType {
+    FIND_ROUTE = 'find-route',
+    TRACK_BUS = 'track-bus',
+    NEARBY_STOPS = 'get-nearby-stops',
+    PROCESS_QUERY = 'process-query'
+}
+
+interface ExtractedParams {
+    origin?: string;
+    destination?: string;
+    busName?: string;
+    busNumber?: string;
+    radiusKm?: number;
+}
+
+interface RouteDecision {
+    endpoint: EndpointType;
+    confidence: number;
+    extractedParams: ExtractedParams;
+    reasoning: string;
+}
+
+const ROUTING_PATTERNS = [
+    { pattern: /(?:where|track|find|locate)\s+(?:is\s+)?(?:the\s+)?(?:bus\s+)?(.+)/i, endpoint: EndpointType.TRACK_BUS, confidence: 0.9 },
+    { pattern: /nearby|near\s*me|closest|around\s*here|nearest\s*stop/i, endpoint: EndpointType.NEARBY_STOPS, confidence: 0.9 },
+    { pattern: /(?:how|can|do)\s+(?:i|we)\s+(?:get|go|reach|travel)\s+(?:to\s+)?(.+)/i, endpoint: EndpointType.FIND_ROUTE, confidence: 0.85 },
+    { pattern: /(.+?)\s+to\s+(.+)/i, endpoint: EndpointType.FIND_ROUTE, confidence: 0.8 },
+];
+
+function routeByIntent(query: string, userLocation?: { latitude: number; longitude: number }): RouteDecision {
+    const q = query.toLowerCase().trim();
+    for (const { pattern, endpoint, confidence } of ROUTING_PATTERNS) {
+        const match = q.match(pattern);
+        if (match) {
+            const params: ExtractedParams = {};
+            if (endpoint === EndpointType.TRACK_BUS && match[1]) {
+                params.busName = match[1].trim();
+            } else if (endpoint === EndpointType.FIND_ROUTE) {
+                if (match.length >= 3) {
+                    params.origin = match[1]?.trim();
+                    params.destination = match[2]?.trim();
+                } else if (match[1]) {
+                    params.destination = match[1].trim();
+                }
+            }
+            return { endpoint, confidence, extractedParams: params, reasoning: `Pattern matched: ${endpoint}` };
+        }
+    }
+    return { endpoint: EndpointType.PROCESS_QUERY, confidence: 0.5, extractedParams: {}, reasoning: 'No specific pattern matched' };
+}
+
+function shouldUseSpecializedEndpoint(decision: RouteDecision): boolean {
+    return decision.endpoint !== EndpointType.PROCESS_QUERY && decision.confidence >= 0.75;
+}
+
+// Confidence tier (inlined from agent-priority.ts)
+enum ConfidenceTier { HIGH = 'HIGH', MEDIUM = 'MEDIUM', LOW = 'LOW', FALLBACK = 'FALLBACK' }
+function getConfidenceTier(confidence: number): ConfidenceTier {
+    if (confidence >= 0.8) return ConfidenceTier.HIGH;
+    if (confidence >= 0.6) return ConfidenceTier.MEDIUM;
+    if (confidence >= 0.4) return ConfidenceTier.LOW;
+    return ConfidenceTier.FALLBACK;
+}
+
+function shouldRetryIntentWithLLM(confidence: number, source: 'pattern' | 'llm', hasApiKey: boolean): { shouldRetry: boolean; reason: string } {
+    if (source === 'llm') return { shouldRetry: false, reason: 'Already from LLM' };
+    if (!hasApiKey) return { shouldRetry: false, reason: 'No API key' };
+    const tier = getConfidenceTier(confidence);
+    if (tier === ConfidenceTier.LOW || tier === ConfidenceTier.FALLBACK) {
+        return { shouldRetry: true, reason: `Confidence is ${tier}` };
+    }
+    return { shouldRetry: false, reason: `Confidence is ${tier}` };
+}
+
+// ============================================================================
+// CORE PRINCIPLES (User Requirements)
+// ============================================================================
+// 1. LATEST Data Only - Always use most recent user location & bus coordinates
+// 2. 3km Radius Filtering - Standard filter from user's last known location
+// 3. No Hallucination - AI must only use grounded data, never make up info
+// 4. Comprehensive Intent Analysis - AI-driven query understanding
+// 5. Keep RAG Memory - MemoryAgent for context retrieval
+// 6. Keep Geocoding - GeocodingAgent for place names
+
+// ============================================================================
+// CONSTANTS & CONFIGURATION
+// ============================================================================
+
+const FILTER_RADIUS_KM = 3; // Standard 3km radius for stop filtering
+const EARTH_RADIUS_KM = 6371;
+const WALKING_SPEED_KMH = 4.5;
+const DEFAULT_BUS_SPEED_KMH = 18;
+
+// LLM Configuration
+const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
+const GROQ_MODEL_FAST = 'llama-3.1-8b-instant';
+const GROQ_MODEL_QUALITY = 'llama-3.3-70b-versatile';
+const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
+const GEMINI_MODEL = 'gemini-2.5-flash';
 
 // ============================================================================
 // TYPES
@@ -22,9 +171,7 @@ interface Vehicle {
     id: string;
     name: string;
     vehicle_number: string;
-    owner_id: string;
     is_active: boolean;
-    created_at: string;
 }
 
 interface RouteStop {
@@ -34,37 +181,86 @@ interface RouteStop {
     latitude: number;
     longitude: number;
     stop_order: number;
-    created_at: string;
 }
 
 interface LiveLocation {
-    id: string;
     bus_id: string;
-    operator_id: string;
     latitude: number;
     longitude: number;
     speed: number | null;
     heading: number | null;
-    timestamp: string;
+    timestamp: number;
+    trip_status?: 'started' | 'stopped';
+    accuracy?: number;
 }
 
-interface AgentContext {
-    taskId: string;
-    userId: string;
-    originalQuery: string;
-    userLocation?: { latitude: number; longitude: number };
-    sharedData: Map<string, unknown>;
-    agentResults: Map<string, AgentOutput>;
-    executionTrace: TraceEvent[];
-    startTime: number;
+interface LocationFreshness {
+    freshnessScore: number;
+    status: 'live' | 'recent' | 'stale' | 'offline';
+    ageSeconds: number;
 }
 
-interface AgentInput {
-    intent: string;
-    parameters: Record<string, unknown>;
-    previousResults?: Record<string, AgentOutput>;
+interface UserLocation {
+    latitude: number;
+    longitude: number;
 }
 
+// Analyzed Intent with subdividing (Layer 1 output)
+interface AnalyzedIntent {
+    primaryIntent: 'FIND_ROUTE' | 'TRACK_BUS' | 'FIND_NEARBY' | 'GENERAL';
+    subIntents: string[];
+    entities: {
+        origin?: string;
+        destination?: string;
+        busName?: string;
+        busNumber?: string;
+        preferences?: string[];
+    };
+    confidence: number;
+    reasoning: string;
+}
+
+// Filtered stop within 3km (Layer 2/3 output)
+interface FilteredStop {
+    stop: RouteStop;
+    distanceKm: number;
+    walkTimeMinutes: number;
+    vehicleName: string;
+    vehicleId: string;
+}
+
+// Filtered bus with LATEST location (Layer 4 output)
+interface FilteredBus {
+    vehicle: Vehicle;
+    latestLocation: LiveLocation;
+    nearestStop: RouteStop | null;
+    stopsAwayFromUser: number;
+    etaMinutes: number;
+    isMoving: boolean;
+    ageSeconds: number;
+    tripStatus?: 'started' | 'stopped' | 'unknown';
+    headingDirection?: string;
+    freshness?: LocationFreshness;
+}
+
+// Route result
+interface RouteResult {
+    vehicleId: string;
+    vehicleName: string;
+    vehicleNumber: string;
+    originStop: string;
+    destinationStop: string;
+    distanceKm: number;
+    etaMinutes: number;
+    stopsInPath: string[];
+    isLive: boolean;
+    busStopsAway?: number;
+    walkTimeMinutes?: number;
+    walkDistanceMeters?: number;
+    routeScore?: number; // Composite score for sorting (live + ETA + freshness)
+}
+
+// Agent output
 interface AgentOutput {
     success: boolean;
     agentName: string;
@@ -72,85 +268,49 @@ interface AgentOutput {
     message?: string;
     error?: string;
     confidence: number;
-    suggestedNextAgent?: string;
-    toolsUsed: string[];
     executionTimeMs: number;
 }
 
-interface TraceEvent {
-    type: string;
-    message: string;
-    data?: Record<string, unknown>;
-    timestamp: number;
-}
-
-interface Agent {
-    name: string;
-    description: string;
-    execute: (context: AgentContext, input: AgentInput) => Promise<AgentOutput>;
-}
-
-interface ProcessQueryRequest {
+// Pipeline context
+interface PipelineContext {
     userId: string;
     query: string;
-    userLocation?: { latitude: number; longitude: number };
-    useLLM?: boolean;  // Optional: disable LLM for testing
-}
+    userLocation?: UserLocation;
+    startTime: number;
 
-interface ProcessQueryResponse {
-    success: boolean;
-    response: string;
-    intent: string;
-    confidence: number;
-    routeData?: unknown;
-    agentTrace: TraceEvent[];
-    executionTimeMs: number;
-    llmUsage?: {
-        intentAnalysis: boolean;
-        resultSynthesis: boolean;
+    // Agent Communication Hub for inter-agent messaging
+    hub: IAgentCommunicationHub;
+
+    // Layer outputs
+    intent?: AnalyzedIntent;
+    filteredStops?: FilteredStop[];
+    nearestStops?: FilteredStop[];
+    filteredBuses?: FilteredBus[];
+    bestRoute?: RouteResult;
+    alternatives?: RouteResult[];
+
+    // Walking directions to nearest stop
+    walkingDirections?: {
+        destinationStop: string;
+        distanceMeters: number;
+        durationMinutes: number;
+        steps: Array<{ instruction: string; distance: number }>;
+        summary: string;
     };
-    error?: string;
+
+    // Agent outputs
+    agentResults: Map<string, AgentOutput>;
+
+    // Shared data
+    vehicles?: Vehicle[];
+    allStops?: RouteStop[];
+    latestLocations?: LiveLocation[];
+    memoryContext?: MemoryContext;
+    geocodedPlaces?: Record<string, string>;
 }
 
-interface AnalyzedIntent {
-    intent: string;
-    confidence: number;
-    entities: {
-        origin?: string;
-        destination?: string;
-        busId?: string;
-        busName?: string;
-        stopName?: string;
-    };
-    requiredAgents: string[];
-    executionMode: 'sequential' | 'parallel';
-    reasoning: string;
-    clarificationNeeded?: string;
-}
-
-// Fleet status for rich AI context
-interface ActiveBusInfo {
-    bus_id: string;
-    bus_name: string;
-    vehicle_number: string | undefined;
-    current_lat: number;
-    current_lng: number;
-    speed_kmh: number;
-    is_moving: boolean;
-    heading: number | null;
-    nearest_stop: string | null;
-    stops_on_route: number;
-    last_update: string;
-    age_seconds: number;
-}
-
-interface FleetStatus {
-    total_vehicles: number;
-    active_buses: number;
-    offline_buses: number;
-    buses_moving: number;
-    buses_stopped: number;
-    active_bus_list: ActiveBusInfo[];
+interface MemoryContext {
+    similarQueries: Array<{ query: string; intent: string; response: string; similarity: number }>;
 }
 
 // ============================================================================
@@ -170,2662 +330,2595 @@ function getSupabase(): SupabaseClient {
 }
 
 // ============================================================================
-// CONTEXT HELPERS
-// ============================================================================
-
-function createContext(
-    userId: string,
-    query: string,
-    userLocation?: { latitude: number; longitude: number }
-): AgentContext {
-    return {
-        taskId: crypto.randomUUID(),
-        userId,
-        originalQuery: query,
-        userLocation,
-        sharedData: new Map(),
-        agentResults: new Map(),
-        executionTrace: [],
-        startTime: Date.now()
-    };
-}
-
-function trace(context: AgentContext, type: string, message: string): void {
-    context.executionTrace.push({ type, message, timestamp: Date.now() });
-    console.log(`[${type}] ${message}`);
-}
-
-function setData(context: AgentContext, key: string, value: unknown): void {
-    context.sharedData.set(key, value);
-}
-
-function getData<T>(context: AgentContext, key: string): T | undefined {
-    return context.sharedData.get(key) as T | undefined;
-}
-
-// ============================================================================
-// LLM CLIENTS - Multi-Provider AI Pipeline
-// ============================================================================
-
-// Groq API (for fast operations)
-const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
-const GROQ_MODEL_FAST = 'llama-3.1-8b-instant';           // ~150 tokens/sec, quick routing
-const GROQ_MODEL_QUALITY = 'llama-3.3-70b-versatile';     // For natural responses
-
-// Gemini API (for main reasoning - MOST POWERFUL MODELS)
-const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
-const GEMINI_MODEL_THINKING = 'gemini-2.5-pro';  // Most powerful thinking model
-const GEMINI_MODEL_FAST = 'gemini-2.5-flash';   // Fast with thinking
-const GEMINI_MODEL_PRO = 'gemini-2.5-flash';              // Production stable
-
-// Model Selection Strategy:
-// - GEMINI THINKING: Main orchestrator reasoning, complex analysis, decision making
-// - GEMINI PRO: Agent analysis, synthesis
-// - GROQ FAST: Quick intent classification (lowest latency)
-// - GROQ QUALITY: Final user-facing response generation
-
-// ============================================================================
-// GEMINI API CLIENT - Main Reasoning Engine
-// ============================================================================
-
-interface GeminiContent {
-    parts: Array<{ text: string }>;
-    role?: string;
-}
-
-interface GeminiRequest {
-    contents: GeminiContent[];
-    generationConfig?: {
-        temperature?: number;
-        maxOutputTokens?: number;
-        responseMimeType?: string;
-    };
-}
-
-// Call Gemini for complex reasoning (MAIN AI - thinking model)
-async function callGeminiThinking(systemPrompt: string, userMessage: string): Promise<string> {
-    const startTime = Date.now();
-    const apiKey = Deno.env.get('GEMINI_API_KEY');
-
-    if (!apiKey) {
-        console.error('[GEMINI ERROR] GEMINI_API_KEY is not set!');
-        throw new Error('GEMINI_API_KEY not set');
-    }
-
-    console.log(`[GEMINI] Starting callGeminiThinking with ${GEMINI_MODEL_THINKING}...`);
-
-    const url = `${GEMINI_API_URL}/${GEMINI_MODEL_THINKING}:generateContent`;
-
-    const payload: GeminiRequest = {
-        contents: [
-            {
-                parts: [{ text: `${systemPrompt}\n\n${userMessage}` }],
-                role: 'user'
-            }
-        ],
-        generationConfig: {
-            temperature: 0.2,      // Low for logical consistency
-            maxOutputTokens: 2048  // More tokens for detailed reasoning
-        }
-    };
-
-    try {
-        const response = await fetch(url, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'x-goog-api-key': apiKey
-            },
-            body: JSON.stringify(payload)
-        });
-
-        if (!response.ok) {
-            const errorText = await response.text();
-            throw new Error(`Gemini API error: ${response.status} - ${errorText}`);
-        }
-
-        const data = await response.json();
-        const content = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-        const elapsed = Date.now() - startTime;
-        console.log(`[GEMINI SUCCESS] callGeminiThinking completed in ${elapsed}ms (${content.length} chars)`);
-        return content;
-    } catch (error) {
-        const elapsed = Date.now() - startTime;
-        console.error(`[GEMINI FAILED] callGeminiThinking failed after ${elapsed}ms:`, error);
-        throw error;
-    }
-}
-
-// Call Gemini for JSON responses
-async function callGeminiJSON(systemPrompt: string, userMessage: string): Promise<string> {
-    const startTime = Date.now();
-    const apiKey = Deno.env.get('GEMINI_API_KEY');
-
-    if (!apiKey) {
-        console.error('[GEMINI ERROR] GEMINI_API_KEY is not set!');
-        throw new Error('GEMINI_API_KEY not set');
-    }
-
-    console.log(`[GEMINI] Starting callGeminiJSON with ${GEMINI_MODEL_PRO}...`);
-
-    const url = `${GEMINI_API_URL}/${GEMINI_MODEL_PRO}:generateContent`;
-
-    const payload: GeminiRequest = {
-        contents: [
-            {
-                parts: [{ text: `${systemPrompt}\n\nRespond ONLY with valid JSON.\n\n${userMessage}` }],
-                role: 'user'
-            }
-        ],
-        generationConfig: {
-            temperature: 0.1,
-            maxOutputTokens: 1024,
-            responseMimeType: 'application/json'
-        }
-    };
-
-    try {
-        const response = await fetch(url, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'x-goog-api-key': apiKey
-            },
-            body: JSON.stringify(payload)
-        });
-
-        if (!response.ok) {
-            const errorText = await response.text();
-            throw new Error(`Gemini API error: ${response.status} - ${errorText}`);
-        }
-
-        const data = await response.json();
-        const content = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-        const elapsed = Date.now() - startTime;
-        console.log(`[GEMINI SUCCESS] callGeminiJSON completed in ${elapsed}ms`);
-        return content;
-    } catch (error) {
-        const elapsed = Date.now() - startTime;
-        console.error(`[GEMINI FAILED] callGeminiJSON failed after ${elapsed}ms:`, error);
-        throw error;
-    }
-}
-
-// ============================================================================
-// RESILIENT AI CALLS - With Automatic Fallback
+// MATHEMATICAL FORMULATIONS
 // ============================================================================
 
 /**
- * Call AI for reasoning with fallback: Gemini Thinking → Groq 70B
+ * Haversine Distance Formula
+ * d = 2R × arcsin(√(sin²((φ₂-φ₁)/2) + cos(φ₁)×cos(φ₂)×sin²((λ₂-λ₁)/2)))
+ * Where: R = Earth radius, φ = latitude, λ = longitude
  */
-async function callAIReasoning(systemPrompt: string, userMessage: string): Promise<string> {
-    // Try Gemini first (main AI)
-    try {
-        const geminiKey = Deno.env.get('GEMINI_API_KEY');
-        if (geminiKey) {
-            console.log('[AI] Using Gemini Thinking for reasoning...');
-            return await callGeminiThinking(systemPrompt, userMessage);
-        }
-    } catch (error) {
-        console.warn('[AI FALLBACK] Gemini failed, falling back to Groq:', error);
-    }
+function haversineDistance(lat1: number, lng1: number, lat2: number, lng2: number): number {
+    const φ1 = lat1 * Math.PI / 180;
+    const φ2 = lat2 * Math.PI / 180;
+    const Δφ = (lat2 - lat1) * Math.PI / 180;
+    const Δλ = (lng2 - lng1) * Math.PI / 180;
 
-    // Fallback to Groq
-    console.log('[AI] Using Groq 70B for reasoning (fallback)...');
-    return await callLLMReasoning(systemPrompt, userMessage);
+    const a = Math.sin(Δφ / 2) ** 2 + Math.cos(φ1) * Math.cos(φ2) * Math.sin(Δλ / 2) ** 2;
+    return EARTH_RADIUS_KM * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
 /**
- * Call AI for JSON responses with fallback: Gemini JSON → Groq
+ * 3km Radius Filter Predicate
+ * P(stop) = { stop | d(user, stop) ≤ 3km }
  */
-async function callAIJSON(systemPrompt: string, userMessage: string): Promise<string> {
-    // Try Gemini first
-    try {
-        const geminiKey = Deno.env.get('GEMINI_API_KEY');
-        if (geminiKey) {
-            console.log('[AI] Using Gemini for JSON response...');
-            return await callGeminiJSON(systemPrompt, userMessage);
-        }
-    } catch (error) {
-        console.warn('[AI FALLBACK] Gemini failed, falling back to Groq:', error);
-    }
-
-    // Fallback to Groq
-    console.log('[AI] Using Groq for JSON response (fallback)...');
-    return await callLLM(systemPrompt, userMessage);
+function isWithin3kmRadius(userLat: number, userLng: number, stopLat: number, stopLng: number): boolean {
+    return haversineDistance(userLat, userLng, stopLat, stopLng) <= FILTER_RADIUS_KM;
 }
 
 /**
- * Call AI for natural language response with fallback: Gemini → Groq
+ * Walk Time Calculation
+ * t_walk = d / v_walk (where v_walk = 4.5 km/h)
  */
-async function callAIText(systemPrompt: string, userMessage: string): Promise<string> {
-    // Try Gemini first
-    try {
-        const geminiKey = Deno.env.get('GEMINI_API_KEY');
-        if (geminiKey) {
-            console.log('[AI] Using Gemini for text response...');
-            return await callGeminiThinking(systemPrompt, userMessage);
-        }
-    } catch (error) {
-        console.warn('[AI FALLBACK] Gemini failed, falling back to Groq:', error);
-    }
-
-    // Fallback to Groq
-    console.log('[AI] Using Groq for text response (fallback)...');
-    return await callLLMText(systemPrompt, userMessage);
+function calculateWalkTime(distanceKm: number): number {
+    return Math.round((distanceKm / WALKING_SPEED_KMH) * 60);
 }
 
-// ============================================================================
-// GROQ API CLIENT - Fast Operations
-// ============================================================================
+/**
+ * ETA Calculation with Traffic Factor
+ * ETA = (d / v) × 60 × f_traffic + n_stops × t_stop
+ * Where: f_traffic = 1.3 during rush hours, t_stop = 0.5 min
+ */
+function calculateETA(distanceKm: number, numStops: number, busSpeed?: number): number {
+    const speed = (busSpeed && busSpeed > 0) ? busSpeed : DEFAULT_BUS_SPEED_KMH;
+    const hour = new Date().getHours();
+    const isRushHour = (hour >= 8 && hour <= 10) || (hour >= 17 && hour <= 20);
+    const trafficFactor = isRushHour ? 1.3 : 1.0;
 
-// Call LLM expecting JSON response
-async function callLLM(systemPrompt: string, userMessage: string): Promise<string> {
-    const startTime = Date.now();
-    const apiKey = Deno.env.get('GROQ_API_KEY');
-    if (!apiKey) {
-        console.error('[LLM ERROR] GROQ_API_KEY is not set!');
-        throw new Error('GROQ_API_KEY not set');
-    }
+    const travelTime = (distanceKm / speed) * 60 * trafficFactor;
+    const stopTime = numStops * 0.5;
 
-    console.log(`[LLM] Starting callLLM (JSON) with ${GROQ_MODEL_FAST}...`);
-
-    try {
-        const response = await fetch(GROQ_API_URL, {
-            method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${apiKey}`,
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-                model: GROQ_MODEL_FAST,
-                messages: [
-                    { role: 'system', content: systemPrompt },
-                    { role: 'user', content: userMessage }
-                ],
-                temperature: 0.1,
-                max_tokens: 400,
-                response_format: { type: 'json_object' }
-            })
-        });
-
-        if (!response.ok) {
-            throw new Error(`Groq API error: ${response.status}`);
-        }
-
-        const data = await response.json();
-        const content = data.choices[0]?.message?.content || '';
-        const elapsed = Date.now() - startTime;
-        console.log(`[LLM SUCCESS] callLLM completed in ${elapsed}ms (${content.length} chars)`);
-        return content;
-    } catch (error) {
-        const elapsed = Date.now() - startTime;
-        console.error(`[LLM FAILED] callLLM failed after ${elapsed}ms:`, error);
-        throw error;
-    }
+    return Math.round(travelTime + stopTime);
 }
 
-// Call LLM expecting natural language response (for final output)
-async function callLLMText(systemPrompt: string, userMessage: string): Promise<string> {
-    const startTime = Date.now();
-    const apiKey = Deno.env.get('GROQ_API_KEY');
-    if (!apiKey) {
-        console.error('[LLM ERROR] GROQ_API_KEY is not set!');
-        throw new Error('GROQ_API_KEY not set');
-    }
+/**
+ * Cardinal Direction from User to Target
+ * θ = atan2(Δλ, Δφ) converted to 8-point compass
+ */
+function getDirection(fromLat: number, fromLng: number, toLat: number, toLng: number): string {
+    const Δφ = toLat - fromLat;
+    const Δλ = toLng - fromLng;
+    const θ = Math.atan2(Δλ, Δφ) * 180 / Math.PI;
+    const normalized = (θ + 360) % 360;
 
-    console.log(`[LLM] Starting callLLMText (Natural Language) with ${GROQ_MODEL_QUALITY}...`);
-
-    try {
-        const response = await fetch(GROQ_API_URL, {
-            method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${apiKey}`,
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-                model: GROQ_MODEL_QUALITY,  // Use quality model for final response
-                messages: [
-                    { role: 'system', content: systemPrompt },
-                    { role: 'user', content: userMessage }
-                ],
-                temperature: 0.3,  // Slightly more creative for natural responses
-                max_tokens: 500
-            })
-        });
-
-        if (!response.ok) {
-            throw new Error(`Groq API error: ${response.status}`);
-        }
-
-        const data = await response.json();
-        const content = data.choices[0]?.message?.content || '';
-        const elapsed = Date.now() - startTime;
-        console.log(`[LLM SUCCESS] callLLMText completed in ${elapsed}ms (${content.length} chars)`);
-        return content;
-    } catch (error) {
-        const elapsed = Date.now() - startTime;
-        console.error(`[LLM FAILED] callLLMText failed after ${elapsed}ms:`, error);
-        throw error;
-    }
+    if (normalized >= 337.5 || normalized < 22.5) return 'north';
+    if (normalized >= 22.5 && normalized < 67.5) return 'northeast';
+    if (normalized >= 67.5 && normalized < 112.5) return 'east';
+    if (normalized >= 112.5 && normalized < 157.5) return 'southeast';
+    if (normalized >= 157.5 && normalized < 202.5) return 'south';
+    if (normalized >= 202.5 && normalized < 247.5) return 'southwest';
+    if (normalized >= 247.5 && normalized < 292.5) return 'west';
+    return 'northwest';
 }
 
-// Call LLM for complex reasoning (uses most powerful model)
-async function callLLMReasoning(systemPrompt: string, userMessage: string): Promise<string> {
-    const startTime = Date.now();
-    const apiKey = Deno.env.get('GROQ_API_KEY');
-    if (!apiKey) {
-        console.error('[LLM ERROR] GROQ_API_KEY is not set!');
-        throw new Error('GROQ_API_KEY not set');
-    }
+/**
+ * Calculate location data freshness for quality assessment
+ */
+function calculateLocationFreshness(location: LiveLocation): LocationFreshness {
+    const ageSeconds = Math.floor((Date.now() - location.timestamp) / 1000);
 
-    console.log(`[LLM] Starting callLLMReasoning (Deep Analysis) with ${GROQ_MODEL_QUALITY}...`);
-
-    try {
-        const response = await fetch(GROQ_API_URL, {
-            method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${apiKey}`,
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-                model: GROQ_MODEL_QUALITY,  // Use 70B model for complex reasoning
-                messages: [
-                    { role: 'system', content: systemPrompt },
-                    { role: 'user', content: userMessage }
-                ],
-                temperature: 0.2,  // Low temp for logical consistency
-                max_tokens: 800,   // More tokens for detailed reasoning
-                response_format: { type: 'json_object' }
-            })
-        });
-
-        if (!response.ok) {
-            throw new Error(`Groq API error: ${response.status}`);
-        }
-
-        const data = await response.json();
-        const content = data.choices[0]?.message?.content || '';
-        const elapsed = Date.now() - startTime;
-        console.log(`[LLM SUCCESS] callLLMReasoning completed in ${elapsed}ms (${content.length} chars)`);
-        return content;
-    } catch (error) {
-        const elapsed = Date.now() - startTime;
-        console.error(`[LLM FAILED] callLLMReasoning failed after ${elapsed}ms:`, error);
-        throw error;
-    }
+    if (ageSeconds < 30) return { freshnessScore: 1.0, status: 'live', ageSeconds };
+    if (ageSeconds < 120) return { freshnessScore: 0.8, status: 'recent', ageSeconds };
+    if (ageSeconds < 300) return { freshnessScore: 0.5, status: 'stale', ageSeconds };
+    return { freshnessScore: 0.2, status: 'offline', ageSeconds };
 }
 
-function parseJSON<T>(content: string): T | null {
-    try {
-        return JSON.parse(content) as T;
-    } catch {
-        const match = content.match(/\{[\s\S]*\}/);
-        if (match) {
-            try { return JSON.parse(match[0]) as T; } catch { /* ignore */ }
-        }
-        return null;
-    }
+/**
+ * Get heading direction from degrees (0-360)
+ */
+function getHeadingDirection(heading: number | null): string | null {
+    if (heading === null || heading === undefined) return null;
+    const directions = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+    const index = Math.round(((heading % 360) + 360) % 360 / 45) % 8;
+    return directions[index];
 }
 
-// ============================================================================
-// AI ANALYSIS PROMPTS - For True AI-Driven Responses
-// ============================================================================
-
-const AGENT_ANALYSIS_PROMPT = `You are an AI analyst reviewing the output of a transportation agent.
-
-Your job is to:
-1. Evaluate if the agent succeeded or failed
-2. Extract the KEY INFORMATION from the agent's data
-3. Identify what ADDITIONAL INFORMATION might be needed
-4. Suggest the NEXT BEST ACTION
-
-Respond in JSON:
-{
-  "evaluation": "success" | "partial" | "failed",
-  "key_findings": ["list of important facts"],
-  "missing_info": ["what's still needed"],
-  "next_action": "recommendation for next step",
-  "confidence": 0.0-1.0
-}`;
-
-const REASONING_PROMPT = `You are the FINAL DECISION MAKER for a bus route AI system.
-
-You have received analyzed outputs from multiple agents. Your job is to:
-1. SYNTHESIZE all the information into a coherent understanding
-2. REASON about the best answer to the user's question
-3. IDENTIFY any gaps or uncertainties
-4. MAKE A DECISION on the best response
-
-Think step by step:
-- What did the user ask?
-- What information did the agents find?
-- What is the BEST answer based on this data?
-- Are there any caveats or alternatives?
-
-Respond in JSON:
-{
-  "reasoning_steps": ["step 1 of thought process", "step 2", ...],
-  "main_finding": "the primary answer to user's question",
-  "alternatives": ["other options if applicable"],
-  "confidence": 0.0-1.0,
-  "caveats": ["any warnings or limitations"]
-}`;
-
-const FINAL_RESPONSE_PROMPT = `You are a helpful bus route assistant for Sahara Bus in India.
-
-Generate a NATURAL, CONVERSATIONAL response based on the AI's reasoning.
-
-RULES:
-1. Be friendly and helpful, like a local guide
-2. Use emojis sparingly: 🚌 bus, 📍 location, ⏱️ time, ✅ success, ❌ issue
-3. Highlight key info with **bold** markdown
-4. Keep response under 80 words
-5. Be specific - use actual bus names, stop names, and times from the data
-6. If there are alternatives, mention them briefly
-7. If there's uncertainty, acknowledge it honestly
-
-DO NOT use generic phrases. Every response should be SPECIFIC to the data provided.`;
-
-// ============================================================================
-// AI PIPELINE FUNCTIONS - Sequential Agent Analysis
-// ============================================================================
-
-interface AgentAnalysis {
-    agentName: string;
-    evaluation: string;
-    keyFindings: string[];
-    missingInfo: string[];
-    nextAction: string;
-    confidence: number;
-}
-
-interface AIReasoning {
-    reasoningSteps: string[];
-    mainFinding: string;
-    alternatives: string[];
-    confidence: number;
-    caveats: string[];
-}
-
-// Analyze a single agent's output using GEMINI
-async function analyzeAgentOutput(agentName: string, output: AgentOutput, query: string): Promise<AgentAnalysis> {
-    const userMessage = `User Query: "${query}"
-
-Agent: ${agentName}
-Success: ${output.success}
-Message: ${output.message || 'N/A'}
-Data: ${JSON.stringify(output.data, null, 2)}
-Error: ${output.error || 'None'}
-
-Analyze this agent's output and respond with JSON containing: evaluation, key_findings, missing_info, next_action, confidence`;
-
-    try {
-        // Use resilient AI call (Gemini → Groq fallback)
-        const response = await callAIJSON(AGENT_ANALYSIS_PROMPT, userMessage);
-        const parsed = parseJSON<{
-            evaluation: string;
-            key_findings: string[];
-            missing_info: string[];
-            next_action: string;
-            confidence: number;
-        }>(response);
-
-        if (parsed) {
-            return {
-                agentName,
-                evaluation: parsed.evaluation,
-                keyFindings: parsed.key_findings || [],
-                missingInfo: parsed.missing_info || [],
-                nextAction: parsed.next_action || '',
-                confidence: parsed.confidence || 0.5
-            };
-        }
-    } catch (error) {
-        console.error(`LLM analysis for ${agentName} failed:`, error);
-    }
-
-    // Minimal fallback
-    return {
-        agentName,
-        evaluation: output.success ? 'success' : 'failed',
-        keyFindings: output.message ? [output.message] : [],
-        missingInfo: [],
-        nextAction: '',
-        confidence: output.confidence
-    };
-}
-
-// Perform multi-agent reasoning using GEMINI THINKING MODEL (main AI)
-async function performAIReasoning(
-    query: string,
-    analyses: AgentAnalysis[],
-    routeData?: Record<string, unknown>
-): Promise<AIReasoning> {
-    const analysisText = analyses.map(a =>
-        `[${a.agentName}] ${a.evaluation.toUpperCase()}\n  Findings: ${a.keyFindings.join('; ')}\n  Missing: ${a.missingInfo.join('; ')}`
-    ).join('\n\n');
-
-    const routeInfo = routeData
-        ? `\nBest Route Found:\n  Bus: ${routeData.vehicleName}\n  Distance: ${routeData.distanceKm} km\n  ETA: ${routeData.etaMinutes} min\n  Live: ${routeData.isLive ? 'Yes' : 'No'}`
-        : '';
-
-    const userMessage = `User Query: "${query}"
-
-Agent Analyses:
-${analysisText}
-${routeInfo}
-
-Now reason step by step about the best response. Think deeply about:
-1. What the user really needs
-2. Which agent findings are most relevant
-3. What's the best answer based on the data
-4. Any alternatives or caveats
-
-Respond in JSON format with: reasoning_steps, main_finding, alternatives, confidence (0-1), caveats`;
-
-    try {
-        // Use resilient AI call (Gemini → Groq fallback)
-        const response = await callAIReasoning(REASONING_PROMPT, userMessage);
-        const parsed = parseJSON<{
-            reasoning_steps: string[];
-            main_finding: string;
-            alternatives: string[];
-            confidence: number;
-            caveats: string[];
-        }>(response);
-
-        if (parsed) {
-            return {
-                reasoningSteps: parsed.reasoning_steps || [],
-                mainFinding: parsed.main_finding || '',
-                alternatives: parsed.alternatives || [],
-                confidence: parsed.confidence || 0.5,
-                caveats: parsed.caveats || []
-            };
-        }
-    } catch (error) {
-        console.error('AI reasoning failed:', error);
-    }
-
-    // Minimal fallback
-    return {
-        reasoningSteps: ['Direct analysis of agent outputs'],
-        mainFinding: analyses.find(a => a.evaluation === 'success')?.keyFindings[0] || 'No clear finding',
-        alternatives: [],
-        confidence: 0.5,
-        caveats: ['AI reasoning encountered an issue']
-    };
-}
-
-// Generate final natural language response using LLM
-async function generateAIResponse(
-    query: string,
-    reasoning: AIReasoning,
-    routeData?: Record<string, unknown>
-): Promise<string> {
-    const routeInfo = routeData
-        ? `Route Data: Bus "${routeData.vehicleName}", ${routeData.distanceKm}km, ETA ${routeData.etaMinutes}min, Live=${routeData.isLive}`
-        : 'No specific route data.';
-
-    const userMessage = `User Query: "${query}"
-
-AI Reasoning:
-${reasoning.reasoningSteps.map((s, i) => `${i + 1}. ${s}`).join('\n')}
-
-Main Finding: ${reasoning.mainFinding}
-Alternatives: ${reasoning.alternatives.join(', ') || 'None'}
-Caveats: ${reasoning.caveats.join(', ') || 'None'}
-Confidence: ${Math.round(reasoning.confidence * 100)}%
-
-${routeInfo}
-
-Generate a natural, helpful response for the user.`;
-
-    try {
-        // Use resilient AI call for natural response (Gemini → Groq fallback)
-        const response = await callAIText(FINAL_RESPONSE_PROMPT, userMessage);
-        return response.trim();
-    } catch (error) {
-        console.error('Final response generation failed:', error);
-        // Last resort - use main finding
-        return `Based on my analysis: ${reasoning.mainFinding}`;
-    }
-}
-
-// ============================================================================
-// INTENT ANALYZER (LLM-Powered) - IMPROVED
-// ============================================================================
-
-const INTENT_PROMPT = `You are the Sahara Bus System intent analyzer. Your job is to understand what transportation help the user needs.
-
-IMPORTANT: Most queries are about TRAVEL. Be AGGRESSIVE about detecting travel intents.
-
-INTENTS (in priority order - check higher ones first):
-1. FIND_ROUTE: User wants to travel somewhere. Keywords: "to", "from", "go", "reach", "get to", "travel", "how do I", "take me", "I want to go", "bus to", any two location names
-2. TRACK_BUS: User wants to find/track a specific bus. Keywords: "where is", "track", "find bus", "locate", bus name/number mentioned
-3. FIND_NEARBY: User wants nearby stops. Keywords: "nearby", "near me", "closest", "around here"
-4. FLEET_STATUS: User wants status of all buses. Keywords: "all buses", "fleet", "how many buses"
-5. GENERAL: ONLY for pure greetings like "hi", "hello", "hey" with nothing else, or "what can you do"
-
-RULES:
-- If query contains ANY location name or travel-related word → NOT GENERAL
-- If query mentions "bus", "route", "stop", "travel", "go", "reach" → it's likely FIND_ROUTE or TRACK_BUS
-- When in doubt, prefer FIND_ROUTE over GENERAL
-- GENERAL should ONLY be used for pure greetings with no travel context
-
-AGENTS:
-- DataAgent: Fetches data (always first)
-- PathAgent: Finds routes between locations
-- TimeAgent: Calculates ETA
-- TrackerAgent: Tracks specific buses
-- AnalyticsAgent: Fleet analysis
-
-Respond in JSON format:
-{"intent":"...","confidence":0.0-1.0,"entities":{"origin":"...","destination":"...","busId":"..."},"requiredAgents":["DataAgent",...],"executionMode":"sequential","reasoning":"..."}`;
-
-// Improved fallback patterns - more aggressive travel detection
-const FALLBACK_PATTERNS: Array<{ pattern: RegExp; intent: string; agents: string[]; priority: number }> = [
-    // High priority: explicit from-to patterns
-    { pattern: /(?:from|at)\s+(.+?)\s+(?:to|towards?)\s+(.+)/i, intent: 'FIND_ROUTE', agents: ['DataAgent', 'PathAgent', 'TimeAgent'], priority: 10 },
-    { pattern: /(.+?)\s+to\s+(.+)/i, intent: 'FIND_ROUTE', agents: ['DataAgent', 'PathAgent', 'TimeAgent'], priority: 9 },
-
-    // Travel intent keywords
-    { pattern: /(?:how|can|do)\s+(?:i|we)\s+(?:get|go|reach|travel)/i, intent: 'FIND_ROUTE', agents: ['DataAgent', 'PathAgent', 'TimeAgent'], priority: 8 },
-    { pattern: /(?:take|bring)\s+me\s+to/i, intent: 'FIND_ROUTE', agents: ['DataAgent', 'PathAgent', 'TimeAgent'], priority: 8 },
-    { pattern: /(?:i\s+want|i\s+need|i'd\s+like)\s+to\s+(?:go|get|reach|travel)/i, intent: 'FIND_ROUTE', agents: ['DataAgent', 'PathAgent', 'TimeAgent'], priority: 8 },
-    { pattern: /(?:bus|route|way)\s+to\s+(.+)/i, intent: 'FIND_ROUTE', agents: ['DataAgent', 'PathAgent', 'TimeAgent'], priority: 7 },
-    { pattern: /(?:going|headed|heading)\s+to\s+(.+)/i, intent: 'FIND_ROUTE', agents: ['DataAgent', 'PathAgent', 'TimeAgent'], priority: 7 },
-
-    // Bus tracking
-    { pattern: /(?:where|track|find|locate)\s+(?:is\s+)?(?:the\s+)?(?:bus\s+)?(.+)/i, intent: 'TRACK_BUS', agents: ['DataAgent', 'TrackerAgent'], priority: 6 },
-
-    // Nearby
-    { pattern: /nearby|near\s+me|closest|around\s+here|nearest/i, intent: 'FIND_NEARBY', agents: ['DataAgent'], priority: 5 },
-
-    // Fleet status
-    { pattern: /(?:all|how\s+many)\s+bus(?:es)?|fleet|active\s+bus/i, intent: 'FLEET_STATUS', agents: ['DataAgent', 'AnalyticsAgent'], priority: 4 },
-
-    // ONLY pure greetings - very strict
-    { pattern: /^(?:hi|hello|hey|help|what\s+can\s+you\s+do)[!?.\s]*$/i, intent: 'GENERAL', agents: [], priority: 1 }
+/**
+ * Vehicle name/number pattern extraction
+ */
+const VEHICLE_PATTERNS = [
+    /bus\s+(?:number\s+)?([A-Z]{2}\s?\d{2}\s?[A-Z]{1,2}\s?\d{4})/i,  // TN 01 AB 1234
+    /(?:where\s+is\s+)?(?:bus\s+)?([A-Z]+\s*\d+)/i,  // Route 12, Bus 45
+    /track\s+(?:bus\s+)?(.+?)(?:\s+bus)?$/i,  // track xyz bus
 ];
 
-// Check if query contains travel-related words (used to prevent false GENERAL)
-function containsTravelKeywords(query: string): boolean {
-    const travelWords = /\b(to|from|bus|route|stop|travel|go|going|reach|get|take|way|how|where|find|track|nearby|near)\b/i;
-    return travelWords.test(query);
-}
-
-function fallbackIntentAnalysis(query: string): AnalyzedIntent {
-    const q = query.toLowerCase().trim();
-
-    // Sort patterns by priority (highest first)
-    const sortedPatterns = [...FALLBACK_PATTERNS].sort((a, b) => b.priority - a.priority);
-
-    for (const { pattern, intent, agents } of sortedPatterns) {
-        const match = q.match(pattern);
-        if (match) {
-            // For GENERAL, double-check it's not actually a travel query
-            if (intent === 'GENERAL' && containsTravelKeywords(q) && q.length > 10) {
-                continue; // Skip GENERAL, try to find a better match
-            }
-
-            const entities: AnalyzedIntent['entities'] = {};
-            if (intent === 'FIND_ROUTE' && match.length >= 3) {
-                entities.origin = match[1]?.replace(/^(how|can|i|get|go|take|me|bus|do|we)\s+/gi, '').trim();
-                entities.destination = match[2]?.replace(/[?.!]$/g, '').trim();
-            } else if (intent === 'TRACK_BUS' && match[1]) {
-                entities.busId = match[1]?.trim();
-                entities.busName = match[1]?.trim();
-            }
-
-            return {
-                intent,
-                confidence: intent === 'GENERAL' ? 0.5 : 0.7,
-                entities,
-                requiredAgents: agents,
-                executionMode: 'sequential',
-                reasoning: 'Pattern match (improved fallback)'
-            };
+function extractVehicleReference(query: string): string | null {
+    for (const pattern of VEHICLE_PATTERNS) {
+        const match = query.match(pattern);
+        if (match && match[1]) {
+            return match[1].trim();
         }
     }
-
-    // If query has travel keywords but no pattern matched, assume FIND_ROUTE with the query as destination
-    if (containsTravelKeywords(q) && q.length > 5) {
-        // Try to extract any location-like words
-        const words = q.split(/\s+/).filter(w => w.length > 2 && !/^(how|can|i|do|the|a|to|from|get|go|is)$/i.test(w));
-        if (words.length > 0) {
-            return {
-                intent: 'FIND_ROUTE',
-                confidence: 0.5,
-                entities: { destination: words.join(' ') },
-                requiredAgents: ['DataAgent', 'PathAgent', 'TimeAgent'],
-                executionMode: 'sequential',
-                reasoning: 'Travel keywords detected, attempting route search'
-            };
-        }
-    }
-
-    // Only return GENERAL if query is very short or truly has no travel context
-    return {
-        intent: q.length <= 10 && !containsTravelKeywords(q) ? 'GENERAL' : 'FIND_ROUTE',
-        confidence: 0.3,
-        entities: q.length > 10 ? { destination: q } : {},
-        requiredAgents: q.length <= 10 && !containsTravelKeywords(q) ? [] : ['DataAgent', 'PathAgent', 'TimeAgent'],
-        executionMode: 'sequential',
-        reasoning: 'Fallback - attempting best guess'
-    };
-}
-
-async function analyzeIntent(query: string, hasLocation: boolean): Promise<AnalyzedIntent> {
-    try {
-        const contextInfo = hasLocation ? 'User has GPS.' : 'No GPS.';
-        const response = await callLLM(INTENT_PROMPT, `${contextInfo}\nQuery: "${query}"`);
-        const parsed = parseJSON<AnalyzedIntent>(response);
-
-        if (parsed && parsed.intent) {
-            if (parsed.requiredAgents.length > 0 && !parsed.requiredAgents.includes('DataAgent')) {
-                parsed.requiredAgents.unshift('DataAgent');
-            }
-            parsed.reasoning = `[LLM] ${parsed.reasoning || ''}`;
-            return parsed;
-        }
-    } catch (error) {
-        console.warn('LLM intent analysis failed:', error);
-    }
-
-    return fallbackIntentAnalysis(query);
+    return null;
 }
 
 // ============================================================================
-// RESPONSE SYNTHESIZER (LLM-Powered)
+// LAYER 1: AI INTENT ANALYSIS (Comprehensive Subdividing)
 // ============================================================================
 
-const SYNTHESIS_PROMPT = `You are a bus route assistant
-
-CRITICAL RULES - FOLLOW EXACTLY:
-1. ONLY use information from the PROVIDED DATA below. Do NOT invent buses, stops, times, or routes.
-2. If data shows "route_found: false" - say NO ROUTE and suggest transfer.
-3. If data shows success - extract the EXACT bus name, distance, ETA from the data.
-4. Use emojis sparingly: 🚌 bus, 📍 location, ⏱️ time
-5. Keep response under 60 words.
-6. If asked about something not in data, say "I don't have that information."
-
-RESPONSE FORMAT:
-- For routes: "🚌 **[BusName from data]** • [distance] km • ~[eta] min"
-- For tracking: "📍 **[BusName]** is near **[StopName from data]**"
-- For no route: "❌ No direct route. [Suggest alternative]"
-
-NEVER MAKE UP BUS NAMES OR STOP NAMES. Use ONLY what appears in the data.`;
-
-async function synthesizeResponse(
-    query: string,
-    agentResults: Map<string, AgentOutput>,
-    routeData?: Record<string, unknown>
-): Promise<string> {
-    // Build EXPLICIT structured context for LLM grounding
-    const groundingContext: string[] = [];
-    groundingContext.push('=== PROVIDED DATA FROM SUPABASE DATABASE ===');
-
-    // DataAgent results
-    const dataResult = agentResults.get('DataAgent');
-    if (dataResult?.success) {
-        groundingContext.push(`[DataAgent] Database has ${dataResult.data.vehicles_count} vehicles, ${dataResult.data.stops_count} stops, ${dataResult.data.live_count} live buses`);
-
-        // Include fleet status for rich context
-        if (dataResult.data.active_buses !== undefined) {
-            groundingContext.push(`[Fleet Status] ${dataResult.data.active_buses} buses currently active:`);
-            groundingContext.push(`  • Moving: ${dataResult.data.buses_moving}, Stopped: ${dataResult.data.buses_stopped}`);
-
-            // List active buses summary
-            const fleetSummary = dataResult.data.fleet_summary as string[] | undefined;
-            if (fleetSummary && fleetSummary.length > 0) {
-                for (const busInfo of fleetSummary) {
-                    groundingContext.push(`  • ${busInfo}`);
-                }
-            }
-        }
-    }
-
-    // PathAgent results - explicit route data
-    const pathResult = agentResults.get('PathAgent');
-    if (pathResult) {
-        if (pathResult.success && routeData) {
-            groundingContext.push(`[PathAgent] SUCCESS - Route found:`);
-            groundingContext.push(`  • Bus Name: "${routeData.vehicleName}"`);
-            groundingContext.push(`  • Vehicle Number: "${routeData.vehicleNumber}"`);
-            groundingContext.push(`  • Distance: ${routeData.distanceKm} km`);
-            groundingContext.push(`  • ETA: ${routeData.etaMinutes} minutes`);
-            groundingContext.push(`  • Stops: ${(routeData.stopsInPath as string[] || []).join(' → ')}`);
-            groundingContext.push(`  • Live Tracking: ${routeData.isLive ? 'YES' : 'NO'}`);
-            if (routeData.isLive && typeof routeData.busStopsAway === 'number') {
-                groundingContext.push(`  • Bus is ${routeData.busStopsAway} stops away from pickup`);
-            }
-        } else {
-            groundingContext.push(`[PathAgent] FAILED - No direct route found between requested stops`);
-            groundingContext.push(`  Suggestion: User may need a transfer route`);
-        }
-    }
-
-    // TrackerAgent results - enhanced with timestamps and stops ahead
-    const trackerResult = agentResults.get('TrackerAgent');
-    if (trackerResult) {
-        if (trackerResult.success) {
-            groundingContext.push(`[TrackerAgent] Bus Location Found:`);
-            groundingContext.push(`  • Bus Name: "${trackerResult.data.bus_name}"`);
-            groundingContext.push(`  • Vehicle Number: "${trackerResult.data.vehicle_number || 'N/A'}"`);
-            groundingContext.push(`  • Nearest Stop: "${trackerResult.data.nearest_stop}"`);
-            groundingContext.push(`  • Speed: ${trackerResult.data.speed} km/h`);
-            groundingContext.push(`  • Status: ${trackerResult.data.is_moving ? 'Moving' : 'Stopped'}`);
-            groundingContext.push(`  • Last Update: ${trackerResult.data.age_seconds}s ago (${trackerResult.data.is_fresh ? 'FRESH' : 'STALE'})`);
-            const stopsAhead = trackerResult.data.stops_ahead as string[] | undefined;
-            if (stopsAhead && stopsAhead.length > 0) {
-                groundingContext.push(`  • Upcoming Stops: ${stopsAhead.join(' → ')}`);
-            }
-        } else {
-            groundingContext.push(`[TrackerAgent] FAILED - ${trackerResult.error || 'Bus not currently broadcasting location'}`);
-            if (trackerResult.data.active_buses) {
-                groundingContext.push(`  • Active buses: ${trackerResult.data.active_buses}`);
-            }
-        }
-    }
-
-    // TimeAgent results
-    const timeResult = agentResults.get('TimeAgent');
-    if (timeResult?.success) {
-        groundingContext.push(`[TimeAgent] ETA Calculation:`);
-        groundingContext.push(`  • Estimated: ${timeResult.data.eta_minutes} minutes`);
-        groundingContext.push(`  • Range: ${timeResult.data.eta_range_min}-${timeResult.data.eta_range_max} minutes`);
-    }
-
-    groundingContext.push('=== END OF DATA ===');
-    groundingContext.push('');
-    groundingContext.push(`User Query: "${query}"`);
-    groundingContext.push('');
-    groundingContext.push('Generate response using ONLY the data above. Do not invent any information.');
-
-    try {
-        const response = await callLLM(
-            SYNTHESIS_PROMPT,
-            groundingContext.join('\n')
-        );
-
-        // Parse response
-        const parsed = parseJSON<{ response?: string }>(response);
-        return parsed?.response || response.replace(/[{}"\n]/g, '').trim();
-    } catch (error) {
-        console.warn('LLM synthesis failed:', error);
-        return generateFallbackResponse(agentResults, routeData);
-    }
-}
-
-
-function generateFallbackResponse(
-    agentResults: Map<string, AgentOutput>,
-    routeData?: Record<string, unknown>
-): string {
-    if (routeData) {
-        const v = routeData.vehicleName || 'Bus';
-        const eta = routeData.etaMinutes || '?';
-        const dist = routeData.distanceKm || '?';
-        let msg = `🚌 **${v}** • ${dist} km • ~${eta} min`;
-        if (routeData.isLive && typeof routeData.busStopsAway === 'number' && routeData.busStopsAway >= 0) {
-            msg += ` • ${routeData.busStopsAway} stops away`;
-        }
-        return msg;
-    }
-
-    const tracker = agentResults.get('TrackerAgent');
-    if (tracker?.success) {
-        return `📍 **${tracker.data.bus_name}** is near **${tracker.data.nearest_stop}**`;
-    }
-
-    const path = agentResults.get('PathAgent');
-    if (path && !path.success) {
-        return '❌ No direct route found. Try asking for a transfer route.';
-    }
-
-    return 'Request processed.';
-}
-
-// ============================================================================
-// ALGORITHMS
-// ============================================================================
-
-function haversineDistance(lat1: number, lng1: number, lat2: number, lng2: number): number {
-    const R = 6371;
-    const dLat = (lat2 - lat1) * Math.PI / 180;
-    const dLng = (lng2 - lng1) * Math.PI / 180;
-    const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLng / 2) ** 2;
-    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-}
-
-function calculateETA(distanceKm: number, numStops: number, busSpeed?: number) {
-    const avgSpeed = busSpeed && busSpeed > 0 ? busSpeed : 18;
-    const hour = new Date().getHours();
-    const isRush = (hour >= 8 && hour <= 10) || (hour >= 17 && hour <= 20);
-    const trafficFactor = isRush ? 1.3 : 1.0;
-    const travelTime = (distanceKm / avgSpeed) * 60 * trafficFactor;
-    const stopTime = numStops * 0.5;
-    return { etaMinutes: Math.round(travelTime + stopTime), trafficFactor };
-}
-
-function findNearbyStops(userLat: number, userLng: number, stops: RouteStop[], vehicles: Vehicle[], radiusKm: number) {
-    const vehicleMap = new Map(vehicles.map(v => [v.id, v]));
-    const nearby: Array<{ name: string; distanceKm: number; vehicleName: string }> = [];
-
-    for (const stop of stops) {
-        const dist = haversineDistance(userLat, userLng, stop.latitude, stop.longitude);
-        if (dist <= radiusKm) {
-            nearby.push({
-                name: stop.name,
-                distanceKm: Math.round(dist * 1000) / 1000,
-                vehicleName: vehicleMap.get(stop.vehicle_id)?.name || stop.vehicle_id
-            });
-        }
-    }
-    return nearby.sort((a, b) => a.distanceKm - b.distanceKm).slice(0, 10);
-}
-
-// ============================================================================
-// ALGORITHM AGENT - OR Algorithms Layer
-// ============================================================================
-
-/**
- * Algorithm types supported by the AlgorithmAgent
- */
-type AlgorithmType = 'KNN' | 'TSP' | 'FIXED_ROUTE_MATCH' | 'MCDA_RANKING' | 'ETA_CALCULATION';
-
-interface AlgorithmSelection {
-    algorithm: AlgorithmType;
-    reason: string;
-    parameters: Record<string, unknown>;
-    priority: number;
-}
-
-interface AlgorithmResult {
-    algorithm: AlgorithmType;
-    success: boolean;
-    data: Record<string, unknown>;
-    executionTimeMs: number;
-}
-
-interface NearbyStopResult {
-    stopName: string;
-    stopId: string;
-    vehicleId: string;
-    vehicleName: string;
-    distanceKm: number;
-    walkTimeMinutes: number;
-    latitude: number;
-    longitude: number;
-}
-
-interface TSPResult {
-    orderedDestinations: string[];
-    totalDistanceKm: number;
-    estimatedTimeMinutes: number;
-    segments: Array<{
-        from: string;
-        to: string;
-        distanceKm: number;
-        vehicleName: string | null;
-    }>;
-    optimizationSavings: {
-        distanceSavedKm: number;
-        timeSavedMinutes: number;
-    };
-}
-
-interface FixedRouteMatch {
-    vehicleId: string;
-    vehicleName: string;
-    vehicleNumber: string;
-    originStop: string;
-    originStopOrder: number;
-    destinationStop: string;
-    destinationStopOrder: number;
-    stopsInPath: string[];
-    pathDistanceKm: number;
-    isValidDirection: boolean;
-    matchConfidence: number;
-}
-
-interface MCDARankedOption {
-    vehicleId: string;
-    vehicleName: string;
-    score: number;
-    ranking: number;
-    factors: {
-        totalTime: number;
-        proximity: number;
-        directness: number;
-        reliability: number;
-    };
-    recommendation: string;
-}
-
-/**
- * K-Nearest Neighbors Algorithm
- * Finds the K nearest bus stops to user's GPS location
- */
-function knnNearestStops(
-    userLat: number,
-    userLng: number,
-    stops: RouteStop[],
-    vehicles: Vehicle[],
-    k: number = 5
-): NearbyStopResult[] {
-    const vehicleMap = new Map(vehicles.map(v => [v.id, v]));
-    const walkSpeedKmh = 4.5; // Average walking speed
-
-    const stopsWithDistance = stops.map(stop => {
-        const distanceKm = haversineDistance(userLat, userLng, stop.latitude, stop.longitude);
-        const walkTimeMinutes = Math.round((distanceKm / walkSpeedKmh) * 60);
-        const vehicle = vehicleMap.get(stop.vehicle_id);
-
-        return {
-            stopName: stop.name,
-            stopId: stop.id,
-            vehicleId: stop.vehicle_id,
-            vehicleName: vehicle?.name || 'Unknown',
-            distanceKm: Math.round(distanceKm * 1000) / 1000,
-            walkTimeMinutes,
-            latitude: stop.latitude,
-            longitude: stop.longitude
-        };
-    });
-
-    // Sort by distance and return top K
-    return stopsWithDistance
-        .sort((a, b) => a.distanceKm - b.distanceKm)
-        .slice(0, k);
-}
-
-/**
- * Traveling Salesman Problem - Nearest Neighbor Heuristic
- * Optimizes the visit order for multiple destinations
- * Time Complexity: O(n²)
- */
-function tspOptimizeOrder(
-    startLocation: { lat: number; lng: number } | null,
-    destinations: string[],
-    stops: RouteStop[],
-    vehicles: Vehicle[]
-): TSPResult {
-    if (destinations.length === 0) {
-        return {
-            orderedDestinations: [],
-            totalDistanceKm: 0,
-            estimatedTimeMinutes: 0,
-            segments: [],
-            optimizationSavings: { distanceSavedKm: 0, timeSavedMinutes: 0 }
-        };
-    }
-
-    if (destinations.length === 1) {
-        return {
-            orderedDestinations: destinations,
-            totalDistanceKm: 0,
-            estimatedTimeMinutes: 0,
-            segments: [],
-            optimizationSavings: { distanceSavedKm: 0, timeSavedMinutes: 0 }
-        };
-    }
-
-    // Find stop coordinates for each destination
-    const destStops: Map<string, RouteStop> = new Map();
-    for (const dest of destinations) {
-        const matchingStop = stops.find(s =>
-            s.name.toLowerCase().includes(dest.toLowerCase()) ||
-            dest.toLowerCase().includes(s.name.toLowerCase())
-        );
-        if (matchingStop) {
-            destStops.set(dest, matchingStop);
-        }
-    }
-
-    // Nearest Neighbor Heuristic
-    const orderedDestinations: string[] = [];
-    const remaining = new Set(destinations);
-    let currentLat = startLocation?.lat ?? 0;
-    let currentLng = startLocation?.lng ?? 0;
-    let totalDistance = 0;
-    const segments: TSPResult['segments'] = [];
-
-    // If no start location, start from first destination
-    if (!startLocation && destStops.size > 0) {
-        const firstDest = destinations[0];
-        const firstStop = destStops.get(firstDest);
-        if (firstStop) {
-            currentLat = firstStop.latitude;
-            currentLng = firstStop.longitude;
-            orderedDestinations.push(firstDest);
-            remaining.delete(firstDest);
-        }
-    }
-
-    while (remaining.size > 0) {
-        let nearestDest: string | null = null;
-        let nearestDistance = Infinity;
-
-        for (const dest of remaining) {
-            const stop = destStops.get(dest);
-            if (stop) {
-                const dist = haversineDistance(currentLat, currentLng, stop.latitude, stop.longitude);
-                if (dist < nearestDistance) {
-                    nearestDistance = dist;
-                    nearestDest = dest;
-                }
-            }
-        }
-
-        if (nearestDest) {
-            const prevDest = orderedDestinations[orderedDestinations.length - 1] || 'Start';
-            segments.push({
-                from: prevDest,
-                to: nearestDest,
-                distanceKm: Math.round(nearestDistance * 100) / 100,
-                vehicleName: null // Will be filled by route matching
-            });
-
-            orderedDestinations.push(nearestDest);
-            remaining.delete(nearestDest);
-            totalDistance += nearestDistance;
-
-            const nearestStop = destStops.get(nearestDest);
-            if (nearestStop) {
-                currentLat = nearestStop.latitude;
-                currentLng = nearestStop.longitude;
-            }
-        } else {
-            // Fallback: add remaining in original order
-            for (const dest of remaining) {
-                orderedDestinations.push(dest);
-            }
-            break;
-        }
-    }
-
-    // Calculate original (unoptimized) distance for comparison
-    let originalDistance = 0;
-    let prevStop: RouteStop | null = null;
-    for (const dest of destinations) {
-        const stop = destStops.get(dest);
-        if (stop && prevStop) {
-            originalDistance += haversineDistance(prevStop.latitude, prevStop.longitude, stop.latitude, stop.longitude);
-        }
-        prevStop = stop || null;
-    }
-
-    const avgSpeedKmh = 20; // Including traffic and stops
-    const estimatedTime = Math.round((totalDistance / avgSpeedKmh) * 60);
-    const originalTime = Math.round((originalDistance / avgSpeedKmh) * 60);
-
-    return {
-        orderedDestinations,
-        totalDistanceKm: Math.round(totalDistance * 100) / 100,
-        estimatedTimeMinutes: estimatedTime,
-        segments,
-        optimizationSavings: {
-            distanceSavedKm: Math.round((originalDistance - totalDistance) * 100) / 100,
-            timeSavedMinutes: Math.max(0, originalTime - estimatedTime)
-        }
-    };
-}
-
-/**
- * Fixed Route Matcher
- * Matches user's origin/destination to predefined fixed bus routes
- * Validates that stops appear in the correct order on the fixed path
- */
-function matchFixedRoutes(
-    origin: string,
-    destination: string,
-    stops: RouteStop[],
-    vehicles: Vehicle[]
-): FixedRouteMatch[] {
-    const vehicleMap = new Map(vehicles.map(v => [v.id, v]));
-    const matches: FixedRouteMatch[] = [];
-
-    // Group stops by vehicle
-    const vehicleStopsMap = new Map<string, RouteStop[]>();
-    for (const stop of stops) {
-        if (!vehicleStopsMap.has(stop.vehicle_id)) {
-            vehicleStopsMap.set(stop.vehicle_id, []);
-        }
-        vehicleStopsMap.get(stop.vehicle_id)!.push(stop);
-    }
-
-    // Sort each vehicle's stops by stop_order (the fixed path)
-    for (const [vehicleId, vehicleStops] of vehicleStopsMap) {
-        vehicleStops.sort((a, b) => a.stop_order - b.stop_order);
-    }
-
-    // Find matches for each vehicle
-    for (const [vehicleId, vehicleStops] of vehicleStopsMap) {
-        const vehicle = vehicleMap.get(vehicleId);
-        if (!vehicle) continue;
-
-        // Find origin stop
-        const originStop = vehicleStops.find(s =>
-            s.name.toLowerCase().includes(origin.toLowerCase()) ||
-            origin.toLowerCase().includes(s.name.toLowerCase())
-        );
-
-        // Find destination stop
-        const destStop = vehicleStops.find(s =>
-            s.name.toLowerCase().includes(destination.toLowerCase()) ||
-            destination.toLowerCase().includes(s.name.toLowerCase())
-        );
-
-        if (!originStop || !destStop) continue;
-
-        // Check direction: destination must come AFTER origin on the fixed path
-        const isValidDirection = destStop.stop_order > originStop.stop_order;
-
-        // Extract stops in path (following the fixed route order)
-        const stopsInPath = vehicleStops
-            .filter(s => s.stop_order >= originStop.stop_order && s.stop_order <= destStop.stop_order)
-            .map(s => s.name);
-
-        // Calculate path distance along the fixed route
-        let pathDistance = 0;
-        const pathStops = vehicleStops.filter(s =>
-            s.stop_order >= originStop.stop_order && s.stop_order <= destStop.stop_order
-        );
-        for (let i = 0; i < pathStops.length - 1; i++) {
-            pathDistance += haversineDistance(
-                pathStops[i].latitude, pathStops[i].longitude,
-                pathStops[i + 1].latitude, pathStops[i + 1].longitude
-            );
-        }
-
-        // Calculate match confidence based on string similarity
-        const originSimilarity = calculateStringSimilarity(origin.toLowerCase(), originStop.name.toLowerCase());
-        const destSimilarity = calculateStringSimilarity(destination.toLowerCase(), destStop.name.toLowerCase());
-        const baseConfidence = (originSimilarity + destSimilarity) / 2;
-        const matchConfidence = isValidDirection ? baseConfidence : baseConfidence * 0.3;
-
-        matches.push({
-            vehicleId,
-            vehicleName: vehicle.name,
-            vehicleNumber: vehicle.vehicle_number,
-            originStop: originStop.name,
-            originStopOrder: originStop.stop_order,
-            destinationStop: destStop.name,
-            destinationStopOrder: destStop.stop_order,
-            stopsInPath,
-            pathDistanceKm: Math.round(pathDistance * 100) / 100,
-            isValidDirection,
-            matchConfidence
-        });
-    }
-
-    // Return only valid direction matches, sorted by confidence
-    return matches
-        .filter(m => m.isValidDirection)
-        .sort((a, b) => b.matchConfidence - a.matchConfidence);
-}
-
-/**
- * String similarity using bigram Jaccard coefficient
- */
-function calculateStringSimilarity(s1: string, s2: string): number {
-    if (s1 === s2) return 1.0;
-    if (s1.length === 0 || s2.length === 0) return 0.0;
-
-    const getBigrams = (s: string): Set<string> => {
-        const bigrams = new Set<string>();
-        for (let i = 0; i < s.length - 1; i++) {
-            bigrams.add(s.substring(i, i + 2));
-        }
-        return bigrams;
-    };
-
-    const bigrams1 = getBigrams(s1);
-    const bigrams2 = getBigrams(s2);
-
-    const intersection = new Set([...bigrams1].filter(x => bigrams2.has(x)));
-    const union = new Set([...bigrams1, ...bigrams2]);
-
-    return union.size > 0 ? intersection.size / union.size : 0;
-}
-
-/**
- * Multi-Criteria Decision Analysis (MCDA)
- * Ranks bus options using weighted criteria
- */
-function mcdaRankOptions(
-    options: BusOption[],
-    liveLocations: LiveLocation[],
-    preference: 'FASTEST' | 'LEAST_WAITING' | 'MOST_DIRECT' = 'FASTEST'
-): MCDARankedOption[] {
-    if (options.length === 0) return [];
-
-    const liveLocationMap = new Map(liveLocations.map(l => [l.bus_id, l]));
-
-    // Define weights based on preference
-    const weights = {
-        FASTEST: { totalTime: 0.50, proximity: 0.30, directness: 0.15, reliability: 0.05 },
-        LEAST_WAITING: { totalTime: 0.20, proximity: 0.50, directness: 0.20, reliability: 0.10 },
-        MOST_DIRECT: { totalTime: 0.30, proximity: 0.20, directness: 0.40, reliability: 0.10 }
-    }[preference];
-
-    const rankedOptions = options.map(option => {
-        const liveLocation = liveLocationMap.get(option.vehicleId);
-
-        // Calculate factors (normalized 0-1)
-        const waitTime = option.isLive && option.busStopsAwayFromPickup > 0
-            ? option.busStopsAwayFromPickup * 2 // ~2 min per stop
-            : 10; // Default wait
-        const travelTime = (option.routeDistanceKm / 18) * 60; // 18 km/h avg
-        const totalTime = waitTime + travelTime;
-
-        const factors = {
-            totalTime: Math.max(0, 1 - (totalTime / 120)), // Lower time = higher score
-            proximity: option.isLive ? Math.max(0, 1 - (option.busStopsAwayFromPickup / 20)) : 0,
-            directness: Math.max(0, 1 - (option.stopsOnRoute / 30)),
-            reliability: option.isLive ? 1.0 : 0.3
-        };
-
-        // Calculate weighted score
-        const score = (
-            factors.totalTime * weights.totalTime +
-            factors.proximity * weights.proximity +
-            factors.directness * weights.directness +
-            factors.reliability * weights.reliability
-        ) * 100;
-
-        // Generate recommendation
-        let recommendation: string;
-        if (option.isLive && option.busStopsAwayFromPickup <= 2) {
-            recommendation = `🚌 ${option.vehicleName} arriving soon - ${option.busStopsAwayFromPickup} stops away`;
-        } else if (factors.directness > 0.7) {
-            recommendation = `🎯 ${option.vehicleName} - Direct route with ${option.stopsOnRoute} stops`;
-        } else {
-            recommendation = `${option.vehicleName} - ${Math.round(totalTime)} min total`;
-        }
-
-        return {
-            vehicleId: option.vehicleId,
-            vehicleName: option.vehicleName,
-            score: Math.round(score * 10) / 10,
-            ranking: 0, // Will be set after sorting
-            factors,
-            recommendation
-        };
-    });
-
-    // Sort by score and assign rankings
-    rankedOptions.sort((a, b) => b.score - a.score);
-    rankedOptions.forEach((opt, idx) => { opt.ranking = idx + 1; });
-
-    return rankedOptions;
-}
-
-/**
- * Algorithm Selector - Uses intent and context to choose algorithms
- */
-function selectAlgorithms(
-    intent: string,
-    entities: { origin?: string; destination?: string; busId?: string },
-    hasUserLocation: boolean,
-    destinationCount: number
-): AlgorithmSelection[] {
-    const selections: AlgorithmSelection[] = [];
-
-    // Always run KNN if user has GPS (for nearby stops context)
-    if (hasUserLocation) {
-        selections.push({
-            algorithm: 'KNN',
-            reason: 'User has GPS - find nearby stops for context',
-            parameters: { k: 5 },
-            priority: 1
-        });
-    }
-
-    // Multi-destination? Use TSP
-    if (destinationCount > 1) {
-        selections.push({
-            algorithm: 'TSP',
-            reason: `Optimizing order for ${destinationCount} destinations`,
-            parameters: { destinationCount },
-            priority: 2
-        });
-    }
-
-    // Route finding? Use Fixed Route Matcher
-    if (intent === 'FIND_ROUTE' && entities.origin && entities.destination) {
-        selections.push({
-            algorithm: 'FIXED_ROUTE_MATCH',
-            reason: 'Matching journey to predefined bus routes',
-            parameters: { origin: entities.origin, destination: entities.destination },
-            priority: 3
-        });
-    }
-
-    // Multiple bus options? Use MCDA to rank
-    if (intent === 'FIND_ROUTE') {
-        selections.push({
-            algorithm: 'MCDA_RANKING',
-            reason: 'Ranking bus options by multiple criteria',
-            parameters: { preference: 'FASTEST' },
-            priority: 4
-        });
-    }
-
-    // Always include ETA calculation for route queries
-    if (intent === 'FIND_ROUTE' || intent === 'TRACK_BUS') {
-        selections.push({
-            algorithm: 'ETA_CALCULATION',
-            reason: 'Computing arrival times',
-            parameters: {},
-            priority: 5
-        });
-    }
-
-    return selections.sort((a, b) => a.priority - b.priority);
-}
-
-// ============================================================================
-// ALGORITHM AGENT
-// ============================================================================
-
-const AlgorithmAgent: Agent = {
-    name: 'AlgorithmAgent',
-    description: 'Executes Operations Research algorithms and shares results with other agents',
-    async execute(context: AgentContext, input: AgentInput): Promise<AgentOutput> {
-        const startTime = Date.now();
-        trace(context, 'AGENT_STARTED', 'AlgorithmAgent: Selecting and executing algorithms');
-
-        const vehicles = getData<Vehicle[]>(context, 'vehicles') || [];
-        const stops = getData<RouteStop[]>(context, 'stops') || [];
-        const liveLocations = getData<LiveLocation[]>(context, 'live_locations') || [];
-
-        const origin = input.parameters.origin as string | undefined;
-        const destination = input.parameters.destination as string | undefined;
-        const userLat = input.parameters.user_lat as number | undefined;
-        const userLng = input.parameters.user_lng as number | undefined;
-        const destinations = input.parameters.destinations as string[] | undefined;
-
-        // Determine which algorithms to run
-        const hasUserLocation = userLat !== undefined && userLng !== undefined;
-        const destinationCount = destinations?.length || (origin && destination ? 1 : 0);
-        const algorithmSelections = selectAlgorithms(
-            input.intent,
-            { origin, destination },
-            hasUserLocation,
-            destinationCount
-        );
-
-        trace(context, 'ALGORITHM_SELECTION', `Selected ${algorithmSelections.length} algorithms: ${algorithmSelections.map(s => s.algorithm).join(', ')}`);
-
-        const results: AlgorithmResult[] = [];
-        const algorithmData: Record<string, unknown> = {};
-
-        // Execute each selected algorithm
-        for (const selection of algorithmSelections) {
-            const algoStart = Date.now();
-
-            try {
-                switch (selection.algorithm) {
-                    case 'KNN': {
-                        if (hasUserLocation) {
-                            const nearbyStops = knnNearestStops(userLat!, userLng!, stops, vehicles, 5);
-                            algorithmData['nearby_stops'] = nearbyStops;
-                            setData(context, 'knn_nearby_stops', nearbyStops);
-                            results.push({
-                                algorithm: 'KNN',
-                                success: true,
-                                data: { count: nearbyStops.length, nearest: nearbyStops[0]?.stopName },
-                                executionTimeMs: Date.now() - algoStart
-                            });
-                            trace(context, 'ALGORITHM_COMPLETE', `KNN: Found ${nearbyStops.length} nearby stops`);
-                        }
-                        break;
-                    }
-
-                    case 'TSP': {
-                        if (destinations && destinations.length > 1) {
-                            const startLoc = hasUserLocation ? { lat: userLat!, lng: userLng! } : null;
-                            const tspResult = tspOptimizeOrder(startLoc, destinations, stops, vehicles);
-                            algorithmData['tsp_result'] = tspResult;
-                            setData(context, 'tsp_optimized_order', tspResult);
-                            results.push({
-                                algorithm: 'TSP',
-                                success: true,
-                                data: {
-                                    order: tspResult.orderedDestinations,
-                                    savedKm: tspResult.optimizationSavings.distanceSavedKm
-                                },
-                                executionTimeMs: Date.now() - algoStart
-                            });
-                            trace(context, 'ALGORITHM_COMPLETE', `TSP: Optimized ${destinations.length} destinations, saved ${tspResult.optimizationSavings.distanceSavedKm}km`);
-                        }
-                        break;
-                    }
-
-                    case 'FIXED_ROUTE_MATCH': {
-                        if (origin && destination) {
-                            const matches = matchFixedRoutes(origin, destination, stops, vehicles);
-                            algorithmData['route_matches'] = matches;
-                            setData(context, 'fixed_route_matches', matches);
-                            results.push({
-                                algorithm: 'FIXED_ROUTE_MATCH',
-                                success: matches.length > 0,
-                                data: { matchCount: matches.length, bestMatch: matches[0]?.vehicleName },
-                                executionTimeMs: Date.now() - algoStart
-                            });
-                            trace(context, 'ALGORITHM_COMPLETE', `Fixed Route Match: Found ${matches.length} matching routes`);
-                        }
-                        break;
-                    }
-
-                    case 'MCDA_RANKING': {
-                        const routeMatches = getData<FixedRouteMatch[]>(context, 'fixed_route_matches') || [];
-                        if (routeMatches.length > 0) {
-                            // Convert to BusOption format
-                            const busOptions: BusOption[] = routeMatches.map(match => {
-                                const liveLocation = liveLocations.find(l => l.bus_id === match.vehicleId);
-                                let busStopsAway = 5; // Default
-
-                                if (liveLocation) {
-                                    const vehicleStops = stops
-                                        .filter(s => s.vehicle_id === match.vehicleId)
-                                        .sort((a, b) => a.stop_order - b.stop_order);
-
-                                    let nearestStopOrder = 0;
-                                    let minDist = Infinity;
-                                    for (const s of vehicleStops) {
-                                        const d = haversineDistance(liveLocation.latitude, liveLocation.longitude, s.latitude, s.longitude);
-                                        if (d < minDist) { minDist = d; nearestStopOrder = s.stop_order; }
-                                    }
-                                    busStopsAway = Math.max(0, match.originStopOrder - nearestStopOrder);
-                                }
-
-                                return {
-                                    vehicleId: match.vehicleId,
-                                    vehicleName: match.vehicleName,
-                                    vehicleNumber: match.vehicleNumber,
-                                    pickupStop: match.originStop,
-                                    pickupStopOrder: match.originStopOrder,
-                                    destinationStop: match.destinationStop,
-                                    destinationStopOrder: match.destinationStopOrder,
-                                    stopsOnRoute: match.stopsInPath.length,
-                                    routeDistanceKm: match.pathDistanceKm,
-                                    isLive: !!liveLocation,
-                                    currentLocation: liveLocation ? {
-                                        lat: liveLocation.latitude,
-                                        lng: liveLocation.longitude,
-                                        speed: liveLocation.speed || 0
-                                    } : undefined,
-                                    busStopsAwayFromPickup: busStopsAway
-                                };
-                            });
-
-                            const rankedOptions = mcdaRankOptions(busOptions, liveLocations, 'FASTEST');
-                            algorithmData['mcda_ranking'] = rankedOptions;
-                            setData(context, 'mcda_ranked_buses', rankedOptions);
-                            results.push({
-                                algorithm: 'MCDA_RANKING',
-                                success: true,
-                                data: { rankedCount: rankedOptions.length, bestOption: rankedOptions[0]?.vehicleName },
-                                executionTimeMs: Date.now() - algoStart
-                            });
-                            trace(context, 'ALGORITHM_COMPLETE', `MCDA: Ranked ${rankedOptions.length} bus options`);
-                        }
-                        break;
-                    }
-
-                    case 'ETA_CALCULATION': {
-                        // ETA is already handled by TimeAgent, just mark as delegated
-                        results.push({
-                            algorithm: 'ETA_CALCULATION',
-                            success: true,
-                            data: { delegatedTo: 'TimeAgent' },
-                            executionTimeMs: 0
-                        });
-                        break;
-                    }
-                }
-            } catch (error) {
-                console.error(`Algorithm ${selection.algorithm} failed:`, error);
-                results.push({
-                    algorithm: selection.algorithm,
-                    success: false,
-                    data: { error: error instanceof Error ? error.message : 'Unknown error' },
-                    executionTimeMs: Date.now() - algoStart
-                });
-            }
-        }
-
-        // Broadcast results to other agents via shared data
-        setData(context, 'algorithm_results', algorithmData);
-
-        const successCount = results.filter(r => r.success).length;
-
-        return {
-            success: successCount > 0,
-            agentName: 'AlgorithmAgent',
-            data: {
-                algorithms_executed: results.map(r => r.algorithm),
-                success_count: successCount,
-                total_count: results.length,
-                results: algorithmData
-            },
-            message: `Executed ${successCount}/${results.length} algorithms successfully`,
-            confidence: successCount / Math.max(1, results.length),
-            toolsUsed: results.map(r => r.algorithm),
-            executionTimeMs: Date.now() - startTime
-        };
-    }
-};
-
-// ============================================================================
-// SMART ROUTE OPTIMIZATION ALGORITHMS
-// ============================================================================
-
-/**
- * Calculate walking time from user's GPS to a bus stop
- * Average walking speed: 4-5 km/h (using 4.5 km/h)
- */
-function calculateWalkTime(userLat: number, userLng: number, stopLat: number, stopLng: number): WalkTimeResult {
-    const distanceKm = haversineDistance(userLat, userLng, stopLat, stopLng);
-    const walkSpeedKmh = 4.5;  // Average walking speed
-    const walkTimeMinutes = (distanceKm / walkSpeedKmh) * 60;
-
-    return {
-        distanceKm: Math.round(distanceKm * 1000) / 1000,
-        distanceMeters: Math.round(distanceKm * 1000),
-        walkTimeMinutes: Math.round(walkTimeMinutes),
-        isWalkable: distanceKm <= 2.0  // Max 2km walking distance
-    };
-}
-
-interface WalkTimeResult {
-    distanceKm: number;
-    distanceMeters: number;
-    walkTimeMinutes: number;
-    isWalkable: boolean;
-}
-
-/**
- * Calculate TOTAL trip time including all phases
- * Total = Walk Time + Wait Time + Travel Time
- */
-function calculateTotalTripTime(
-    walkTimeMinutes: number,
-    busEtaToPickup: number,  // Time for bus to reach pickup stop
-    travelTimeMinutes: number  // Time from pickup to destination
-): TotalTripResult {
-    // Wait time: how long user waits at stop after arriving
-    // If bus arrives before user, wait time is 0
-    // If user arrives before bus, wait time = busETA - walkTime
-    const waitTimeMinutes = Math.max(0, busEtaToPickup - walkTimeMinutes);
-
-    // User should leave now and walk to the stop
-    const shouldLeaveIn = Math.max(0, busEtaToPickup - walkTimeMinutes - 2); // 2 min buffer
-
-    const totalMinutes = walkTimeMinutes + waitTimeMinutes + travelTimeMinutes;
-
-    return {
-        walkTimeMinutes,
-        waitTimeMinutes: Math.round(waitTimeMinutes),
-        travelTimeMinutes: Math.round(travelTimeMinutes),
-        totalTripMinutes: Math.round(totalMinutes),
-        shouldLeaveIn: Math.round(shouldLeaveIn),
-        willMissbus: walkTimeMinutes > busEtaToPickup + 2  // Adding 2 min grace period
-    };
-}
-
-interface TotalTripResult {
-    walkTimeMinutes: number;
-    waitTimeMinutes: number;
-    travelTimeMinutes: number;
-    totalTripMinutes: number;
-    shouldLeaveIn: number;
-    willMissbus: boolean;
-}
-
-/**
- * Bus route option for comparison
- */
-interface BusOption {
-    vehicleId: string;
-    vehicleName: string;
-    vehicleNumber: string;
-    pickupStop: string;
-    pickupStopOrder: number;
-    destinationStop: string;
-    destinationStopOrder: number;
-    stopsOnRoute: number;  // Stops between pickup and destination
-    routeDistanceKm: number;
-    isLive: boolean;
-    currentLocation?: { lat: number; lng: number; speed: number };
-    busStopsAwayFromPickup: number;
-}
-
-/**
- * Find the OPTIMAL bus considering total trip time
- * Handles the case: Bus A (longer route) arrives first vs Bus B (shorter route) arrives later
- */
-function findOptimalBus(
-    userLat: number,
-    userLng: number,
-    options: BusOption[],
-    stops: RouteStop[],
-    liveLocations: LiveLocation[]
-): OptimalBusResult | null {
-    if (options.length === 0) return null;
-
-    const comparisons: BusComparison[] = [];
-
-    for (const option of options) {
-        // 1. Find the pickup stop coordinates
-        const pickupStop = stops.find(s =>
-            s.vehicle_id === option.vehicleId &&
-            s.name.toLowerCase() === option.pickupStop.toLowerCase()
-        );
-
-        if (!pickupStop) continue;
-
-        // 2. Calculate WALK TIME from user to pickup stop
-        const walkResult = calculateWalkTime(userLat, userLng, pickupStop.latitude, pickupStop.longitude);
-
-        // 3. Calculate BUS ETA to pickup stop
-        let busEtaToPickup: number;
-
-        if (option.isLive && option.currentLocation) {
-            // Use live location to calculate ETA
-            const busDistanceToPickup = haversineDistance(
-                option.currentLocation.lat,
-                option.currentLocation.lng,
-                pickupStop.latitude,
-                pickupStop.longitude
-            );
-            const speed = option.currentLocation.speed > 0 ? option.currentLocation.speed : 18;
-            busEtaToPickup = (busDistanceToPickup / speed) * 60 + (option.busStopsAwayFromPickup * 0.5);
-        } else {
-            // Estimate based on stops away (2 min per stop)
-            busEtaToPickup = option.busStopsAwayFromPickup * 2;
-        }
-
-        // 4. Calculate TRAVEL TIME from pickup to destination
-        const eta = calculateETA(option.routeDistanceKm, option.stopsOnRoute, option.currentLocation?.speed);
-        const travelTime = eta.etaMinutes;
-
-        // 5. Calculate TOTAL TRIP TIME
-        const tripResult = calculateTotalTripTime(walkResult.walkTimeMinutes, busEtaToPickup, travelTime);
-
-        comparisons.push({
-            option,
-            walkResult,
-            busEtaToPickup: Math.round(busEtaToPickup),
-            travelTime,
-            tripResult,
-            score: tripResult.totalTripMinutes + (tripResult.willMissbus ? 100 : 0)  // Penalize if will miss bus
-        });
-    }
-
-    // Sort by score (lowest total trip time wins)
-    comparisons.sort((a, b) => a.score - b.score);
-
-    if (comparisons.length === 0) return null;
-
-    const best = comparisons[0];
-    const alternatives = comparisons.slice(1, 3);  // Top 2 alternatives
-
-    return {
-        bestBus: {
-            vehicleId: best.option.vehicleId,
-            vehicleName: best.option.vehicleName,
-            vehicleNumber: best.option.vehicleNumber,
-            pickupStop: best.option.pickupStop,
-            destinationStop: best.option.destinationStop,
-            isLive: best.option.isLive
-        },
-        walkToStop: best.walkResult,
-        busArrivesIn: best.busEtaToPickup,
-        waitAtStop: best.tripResult.waitTimeMinutes,
-        travelTime: best.travelTime,
-        totalTripTime: best.tripResult.totalTripMinutes,
-        shouldLeaveIn: best.tripResult.shouldLeaveIn,
-        willMissBus: best.tripResult.willMissbus,
-        recommendation: generateRecommendation(best),
-        alternatives: alternatives.map(alt => ({
-            vehicleName: alt.option.vehicleName,
-            totalTripTime: alt.tripResult.totalTripMinutes,
-            reason: alt.tripResult.totalTripMinutes - best.tripResult.totalTripMinutes > 0
-                ? `${alt.tripResult.totalTripMinutes - best.tripResult.totalTripMinutes} min slower`
-                : 'Similar time'
-        }))
-    };
-}
-
-interface BusComparison {
-    option: BusOption;
-    walkResult: WalkTimeResult;
-    busEtaToPickup: number;
-    travelTime: number;
-    tripResult: TotalTripResult;
-    score: number;
-}
-
-interface OptimalBusResult {
-    bestBus: {
-        vehicleId: string;
-        vehicleName: string;
-        vehicleNumber: string;
-        pickupStop: string;
-        destinationStop: string;
-        isLive: boolean;
-    };
-    walkToStop: WalkTimeResult;
-    busArrivesIn: number;
-    waitAtStop: number;
-    travelTime: number;
-    totalTripTime: number;
-    shouldLeaveIn: number;
-    willMissBus: boolean;
-    recommendation: string;
-    alternatives: Array<{
-        vehicleName: string;
-        totalTripTime: number;
-        reason: string;
-    }>;
-}
-
-function generateRecommendation(comparison: BusComparison): string {
-    const { walkResult, tripResult, option } = comparison;
-
-    if (tripResult.willMissbus) {
-        return `Bus ${option.vehicleName} is too close. Walk faster or wait for next bus.`;
-    }
-
-    if (tripResult.shouldLeaveIn <= 0) {
-        return `Leave NOW! Walk ${walkResult.distanceMeters}m to ${option.pickupStop}.`;
-    }
-
-    if (tripResult.waitTimeMinutes > 10) {
-        return `Leave in ${tripResult.shouldLeaveIn} min. You'll wait ${tripResult.waitTimeMinutes} min at the stop.`;
-    }
-
-    return `Leave in ${tripResult.shouldLeaveIn} min. ${option.vehicleName} arriving in ${comparison.busEtaToPickup} min.`;
-}
-
-// ============================================================================
-// AGENTS
-// ============================================================================
-
-const DataAgent: Agent = {
-    name: 'DataAgent',
-    description: 'Fetches data from Supabase and computes fleet status',
-    async execute(context: AgentContext, _input: AgentInput): Promise<AgentOutput> {
-        const startTime = Date.now();
-        trace(context, 'AGENT_STARTED', 'DataAgent: Fetching comprehensive data');
-
+const INTENT_ANALYSIS_PROMPT = `You are the Sahara Bus AI intent analyzer. Analyze the user's query comprehensively.
+
+INTENTS (in order of priority):
+1. FIND_ROUTE - User wants to travel from A to B
+   Keywords: "to", "from", "go", "reach", "get to", "travel", "how do I", "bus to", two locations
+2. TRACK_BUS - User wants to find/track a specific bus
+   Keywords: "where is", "track", "find bus", "locate", bus name/number
+3. FIND_NEARBY - User wants stops/buses near their location
+   Keywords: "nearby", "near me", "closest", "around here"
+4. GENERAL - Pure greetings only ("hi", "hello", "help")
+
+SUBDIVIDING RULES:
+- Extract ALL entities: origin, destination, bus name, preferences
+- Identify sub-intents: shortest_route, alternative_options, fastest, cheapest
+- If query mentions "shortest" or "fastest" → add to preferences
+- If query mentions "alternative" or "other" → add 'alternative_options' to subIntents
+
+OUTPUT (JSON only):
+{
+  "primaryIntent": "FIND_ROUTE" | "TRACK_BUS" | "FIND_NEARBY" | "GENERAL",
+  "subIntents": ["shortest_route", "alternative_options"],
+  "entities": {
+    "origin": "extracted origin or null",
+    "destination": "extracted destination or null",
+    "busName": "bus name if mentioned or null",
+    "preferences": ["fastest", "shortest"]
+  },
+  "confidence": 0.0-1.0,
+  "reasoning": "brief explanation"
+}`;
+
+// Fallback patterns for deterministic intent analysis
+const INTENT_PATTERNS = [
+    { pattern: /(?:from|at)\s+(.+?)\s+(?:to|towards?)\s+(.+)/i, intent: 'FIND_ROUTE' as const, priority: 10 },
+    { pattern: /(.+?)\s+to\s+(.+)/i, intent: 'FIND_ROUTE' as const, priority: 9 },
+    { pattern: /(?:how|can|do)\s+(?:i|we)\s+(?:get|go|reach|travel)/i, intent: 'FIND_ROUTE' as const, priority: 8 },
+    { pattern: /(?:bus|route|way)\s+to\s+(.+)/i, intent: 'FIND_ROUTE' as const, priority: 7 },
+    { pattern: /(?:where|track|find|locate)\s+(?:is\s+)?(?:the\s+)?(?:bus\s+)?(.+)/i, intent: 'TRACK_BUS' as const, priority: 6 },
+    { pattern: /nearby|near\s+me|closest|around\s+here|nearest/i, intent: 'FIND_NEARBY' as const, priority: 5 },
+    { pattern: /^(?:hi|hello|hey|help)[!?.\s]*$/i, intent: 'GENERAL' as const, priority: 1 },
+];
+
+async function analyzeIntentWithAI(query: string): Promise<AnalyzedIntent> {
+    const apiKey = Deno.env.get('GROQ_API_KEY');
+
+    // ========================================
+    // PHASE 3: Tiered Intent Analysis
+    // 1. Try LLM first if available
+    // 2. Fall back to patterns
+    // 3. Retry with LLM if pattern confidence is LOW
+    // ========================================
+
+    if (apiKey) {
         try {
-            const client = getSupabase();
-            const [vehicles, stops, locations] = await Promise.all([
-                client.from('vehicles').select('*'),
-                client.from('route_stops').select('*').order('vehicle_id').order('stop_order'),
-                client.from('locations').select('*').order('timestamp', { ascending: false }).limit(500)
-            ]);
-
-            const vehiclesData = (vehicles.data || []) as Vehicle[];
-            const stopsData = (stops.data || []) as RouteStop[];
-            const locationsData = (locations.data || []) as LiveLocation[];
-
-            // Get latest location per bus
-            const latestLocations = new Map<string, LiveLocation>();
-            for (const loc of locationsData) {
-                if (!latestLocations.has(loc.bus_id)) {
-                    latestLocations.set(loc.bus_id, loc);
-                }
-            }
-
-            // Build vehicle lookup
-            const vehicleMap = new Map(vehiclesData.map(v => [v.id, v]));
-
-            // Group stops by vehicle
-            const stopsByVehicle = new Map<string, RouteStop[]>();
-            for (const stop of stopsData) {
-                if (!stopsByVehicle.has(stop.vehicle_id)) {
-                    stopsByVehicle.set(stop.vehicle_id, []);
-                }
-                stopsByVehicle.get(stop.vehicle_id)!.push(stop);
-            }
-
-            // Build rich fleet status for AI context
-            const now = Date.now();
-            const activeBusList: ActiveBusInfo[] = [];
-            let busesMoving = 0;
-            let busesStopped = 0;
-
-            for (const [busId, loc] of latestLocations) {
-                const vehicle = vehicleMap.get(busId);
-                const vehicleStops = stopsByVehicle.get(busId) || [];
-                const ageSeconds = Math.floor((now - new Date(loc.timestamp).getTime()) / 1000);
-
-                // Only include fresh locations (within 5 minutes)
-                if (ageSeconds > 300) continue;
-
-                // Find nearest stop
-                let nearestStop: string | null = null;
-                let minDist = Infinity;
-                for (const stop of vehicleStops) {
-                    const dist = haversineDistance(loc.latitude, loc.longitude, stop.latitude, stop.longitude);
-                    if (dist < minDist) {
-                        minDist = dist;
-                        nearestStop = stop.name;
-                    }
-                }
-
-                const isMoving = (loc.speed || 0) > 2;
-                if (isMoving) busesMoving++;
-                else busesStopped++;
-
-                activeBusList.push({
-                    bus_id: busId,
-                    bus_name: vehicle?.name || 'Unknown',
-                    vehicle_number: vehicle?.vehicle_number,
-                    current_lat: loc.latitude,
-                    current_lng: loc.longitude,
-                    speed_kmh: loc.speed || 0,
-                    is_moving: isMoving,
-                    heading: loc.heading,
-                    nearest_stop: nearestStop,
-                    stops_on_route: vehicleStops.length,
-                    last_update: loc.timestamp,
-                    age_seconds: ageSeconds
-                });
-            }
-
-            // Sort by freshness (most recent first)
-            activeBusList.sort((a, b) => a.age_seconds - b.age_seconds);
-
-            const fleetStatus: FleetStatus = {
-                total_vehicles: vehiclesData.length,
-                active_buses: activeBusList.length,
-                offline_buses: vehiclesData.length - activeBusList.length,
-                buses_moving: busesMoving,
-                buses_stopped: busesStopped,
-                active_bus_list: activeBusList
-            };
-
-            // Store all data in shared context
-            setData(context, 'vehicles', vehiclesData);
-            setData(context, 'stops', stopsData);
-            setData(context, 'live_locations', Array.from(latestLocations.values()));
-            setData(context, 'fleet_status', fleetStatus);
-
-            trace(context, 'FLEET_STATUS', `Fleet: ${activeBusList.length} active (${busesMoving} moving, ${busesStopped} stopped)`);
-
-            return {
-                success: true,
-                agentName: 'DataAgent',
-                data: {
-                    vehicles_count: vehiclesData.length,
-                    stops_count: stopsData.length,
-                    live_count: latestLocations.size,
-                    active_buses: activeBusList.length,
-                    buses_moving: busesMoving,
-                    buses_stopped: busesStopped,
-                    fleet_summary: activeBusList.slice(0, 5).map(b =>
-                        `${b.bus_name}: ${b.is_moving ? 'moving' : 'stopped'} near ${b.nearest_stop || 'unknown'}`
-                    )
-                },
-                message: `Loaded ${vehiclesData.length} vehicles, ${stopsData.length} stops. Fleet: ${activeBusList.length} active buses`,
-                confidence: 1.0,
-                toolsUsed: ['supabase_query', 'fleet_analysis'],
-                executionTimeMs: Date.now() - startTime
-            };
-        } catch (error) {
-            return {
-                success: false, agentName: 'DataAgent', data: {},
-                error: error instanceof Error ? error.message : 'Data fetch failed',
-                confidence: 0, toolsUsed: [], executionTimeMs: Date.now() - startTime
-            };
-        }
-    }
-};
-
-const PathAgent: Agent = {
-    name: 'PathAgent',
-    description: 'Finds routes',
-    async execute(context: AgentContext, input: AgentInput): Promise<AgentOutput> {
-        const startTime = Date.now();
-        trace(context, 'AGENT_STARTED', 'PathAgent: Finding routes');
-
-        const origin = input.parameters.origin as string;
-        const destination = input.parameters.destination as string;
-
-        if (!origin || !destination) {
-            return { success: false, agentName: 'PathAgent', data: {}, error: 'Origin and destination required', confidence: 0, toolsUsed: [], executionTimeMs: Date.now() - startTime };
-        }
-
-        const vehicles = getData<Vehicle[]>(context, 'vehicles') || [];
-        const stops = getData<RouteStop[]>(context, 'stops') || [];
-        const locations = getData<LiveLocation[]>(context, 'live_locations') || [];
-        const userLat = input.parameters.user_lat as number | undefined;
-        const userLng = input.parameters.user_lng as number | undefined;
-
-        // Build bus options for comparison
-        const busOptions: BusOption[] = [];
-        const matchedRoutes: Array<{
-            vehicleId: string;
-            vehicleName: string;
-            vehicleNumber: string;
-            distanceKm: number;
-            numStops: number;
-            etaMinutes: number;
-            isLive: boolean;
-            busStopsAway?: number;
-            stopsInPath: string[];
-        }> = [];
-
-        for (const vehicle of vehicles) {
-            const vehicleStops = stops.filter(s => s.vehicle_id === vehicle.id).sort((a, b) => a.stop_order - b.stop_order);
-            const originStop = vehicleStops.find(s => s.name.toLowerCase().includes(origin.toLowerCase()));
-            const destStop = vehicleStops.find(s => s.name.toLowerCase().includes(destination.toLowerCase()));
-
-            if (originStop && destStop && originStop.stop_order < destStop.stop_order) {
-                const stopsInPath = vehicleStops.filter(s => s.stop_order >= originStop.stop_order && s.stop_order <= destStop.stop_order);
-
-                let distance = 0;
-                for (let i = 0; i < stopsInPath.length - 1; i++) {
-                    distance += haversineDistance(stopsInPath[i].latitude, stopsInPath[i].longitude, stopsInPath[i + 1].latitude, stopsInPath[i + 1].longitude);
-                }
-
-                const liveLocation = locations.find(l => l.bus_id === vehicle.id);
-                const eta = calculateETA(distance, stopsInPath.length - 1, liveLocation?.speed || undefined);
-
-                let busStopsAway: number | undefined = undefined;
-                let currentStopOrder = 0;
-                if (liveLocation) {
-                    let minDist = Infinity;
-                    for (const s of vehicleStops) {
-                        const d = haversineDistance(liveLocation.latitude, liveLocation.longitude, s.latitude, s.longitude);
-                        if (d < minDist) { minDist = d; currentStopOrder = s.stop_order; }
-                    }
-                    busStopsAway = Math.max(0, originStop.stop_order - currentStopOrder);
-                }
-
-                matchedRoutes.push({
-                    vehicleId: vehicle.id,
-                    vehicleName: vehicle.name,
-                    vehicleNumber: vehicle.vehicle_number,
-                    distanceKm: Math.round(distance * 10) / 10,
-                    numStops: stopsInPath.length - 1,
-                    etaMinutes: eta.etaMinutes,
-                    isLive: !!liveLocation,
-                    busStopsAway,
-                    stopsInPath: stopsInPath.map(s => s.name)
-                });
-
-                // Also build BusOption for optimal bus calculation
-                busOptions.push({
-                    vehicleId: vehicle.id,
-                    vehicleName: vehicle.name,
-                    vehicleNumber: vehicle.vehicle_number,
-                    pickupStop: originStop.name,
-                    pickupStopOrder: originStop.stop_order,
-                    destinationStop: destStop.name,
-                    destinationStopOrder: destStop.stop_order,
-                    stopsOnRoute: stopsInPath.length - 1,
-                    routeDistanceKm: distance,
-                    isLive: !!liveLocation,
-                    currentLocation: liveLocation ? {
-                        lat: liveLocation.latitude,
-                        lng: liveLocation.longitude,
-                        speed: liveLocation.speed || 0
-                    } : undefined,
-                    busStopsAwayFromPickup: busStopsAway || 5  // Default estimate
-                });
-            }
-        }
-
-        if (matchedRoutes.length === 0) {
-            return { success: false, agentName: 'PathAgent', data: { route_found: false }, error: 'No direct route found', suggestedNextAgent: 'TransferAgent', confidence: 0, toolsUsed: ['compute_route'], executionTimeMs: Date.now() - startTime };
-        }
-
-        // ====================================================================
-        // SMART ROUTE OPTIMIZATION: Use findOptimalBus when user has GPS
-        // This considers: Walk Time + Wait Time + Travel Time = Total Trip
-        // ====================================================================
-        let bestRoute = matchedRoutes[0];
-        let optimizationResult: OptimalBusResult | null = null;
-
-        if (userLat !== undefined && userLng !== undefined && busOptions.length > 0) {
-            trace(context, 'OPTIMIZATION', `Comparing ${busOptions.length} bus options with total trip time...`);
-
-            optimizationResult = findOptimalBus(userLat, userLng, busOptions, stops, locations);
-
-            if (optimizationResult) {
-                // Find the matching route for the optimal bus
-                const optimalRoute = matchedRoutes.find(r => r.vehicleId === optimizationResult!.bestBus.vehicleId);
-                if (optimalRoute) {
-                    bestRoute = optimalRoute;
-                    trace(context, 'OPTIMIZATION_RESULT', `Best: ${bestRoute.vehicleName} - Total ${optimizationResult.totalTripTime} min (walk ${optimizationResult.walkToStop.walkTimeMinutes}, wait ${optimizationResult.waitAtStop}, travel ${optimizationResult.travelTime})`);
-                }
-            }
-        } else {
-            // No GPS - just sort by ETA
-            matchedRoutes.sort((a, b) => a.etaMinutes - b.etaMinutes);
-            bestRoute = matchedRoutes[0];
-        }
-
-        // Store enhanced route data
-        const enhancedBestRoute = {
-            ...bestRoute,
-            // Add optimization data if available
-            walkTimeMinutes: optimizationResult?.walkToStop.walkTimeMinutes,
-            walkDistanceMeters: optimizationResult?.walkToStop.distanceMeters,
-            waitTimeMinutes: optimizationResult?.waitAtStop,
-            totalTripMinutes: optimizationResult?.totalTripTime,
-            shouldLeaveIn: optimizationResult?.shouldLeaveIn,
-            willMissBus: optimizationResult?.willMissBus,
-            recommendation: optimizationResult?.recommendation,
-            alternatives: optimizationResult?.alternatives
-        };
-
-        setData(context, 'best_route', enhancedBestRoute);
-        setData(context, 'alternatives', matchedRoutes.filter(r => r.vehicleId !== bestRoute.vehicleId).slice(0, 2));
-
-        // Build message
-        let message = `Found route via ${bestRoute.vehicleName}`;
-        if (optimizationResult) {
-            message = `${bestRoute.vehicleName}: Walk ${optimizationResult.walkToStop.distanceMeters}m → Wait ${optimizationResult.waitAtStop} min → Travel ${optimizationResult.travelTime} min = Total ${optimizationResult.totalTripTime} min`;
-        }
-
-        return {
-            success: true,
-            agentName: 'PathAgent',
-            data: {
-                best_route: enhancedBestRoute,
-                alternatives: matchedRoutes.filter(r => r.vehicleId !== bestRoute.vehicleId).slice(0, 2),
-                route_found: true,
-                optimization_used: !!optimizationResult
-            },
-            message,
-            confidence: 0.9,
-            toolsUsed: ['compute_route', 'find_optimal_bus'],
-            executionTimeMs: Date.now() - startTime
-        };
-    }
-};
-
-const TrackerAgent: Agent = {
-    name: 'TrackerAgent',
-    description: 'Tracks bus position with real-time context',
-    async execute(context: AgentContext, input: AgentInput): Promise<AgentOutput> {
-        const startTime = Date.now();
-        trace(context, 'AGENT_STARTED', 'TrackerAgent: Tracking bus with enhanced context');
-
-        const targetBusId = input.parameters.bus_id as string;
-        const targetBusName = input.parameters.vehicle_name as string;
-
-        const vehicles = getData<Vehicle[]>(context, 'vehicles') || [];
-        const stops = getData<RouteStop[]>(context, 'stops') || [];
-        const locations = getData<LiveLocation[]>(context, 'live_locations') || [];
-
-        let liveLocation: LiveLocation | undefined;
-
-        // Find by ID first
-        if (targetBusId) {
-            liveLocation = locations.find(l => l.bus_id === targetBusId);
-        }
-        // Then try by name
-        if (!liveLocation && targetBusName) {
-            liveLocation = locations.find(loc => {
-                const v = vehicles.find(v => v.id === loc.bus_id);
-                return v?.name.toLowerCase().includes(targetBusName.toLowerCase());
-            });
-        }
-
-        if (!liveLocation) {
-            // Provide helpful error with list of active buses
-            const fleetStatus = getData<FleetStatus>(context, 'fleet_status');
-            const activeBusNames = fleetStatus?.active_bus_list.slice(0, 5).map(b => b.bus_name).join(', ') || 'none';
-            return {
-                success: false,
-                agentName: 'TrackerAgent',
-                data: { active_buses: activeBusNames },
-                error: `Bus "${targetBusName || targetBusId}" is not currently broadcasting. Active buses: ${activeBusNames}`,
-                confidence: 0,
-                toolsUsed: [],
-                executionTimeMs: Date.now() - startTime
-            };
-        }
-
-        const vehicle = vehicles.find(v => v.id === liveLocation!.bus_id);
-        const routeStops = stops.filter(s => s.vehicle_id === liveLocation!.bus_id).sort((a, b) => a.stop_order - b.stop_order);
-
-        // Find nearest stop and its position on route
-        let nearestStop = routeStops[0];
-        let nearestStopOrder = 0;
-        let minDist = Infinity;
-        for (const s of routeStops) {
-            const d = haversineDistance(liveLocation.latitude, liveLocation.longitude, s.latitude, s.longitude);
-            if (d < minDist) {
-                minDist = d;
-                nearestStop = s;
-                nearestStopOrder = s.stop_order;
-            }
-        }
-
-        // Get stops ahead (remaining on route)
-        const stopsAhead = routeStops
-            .filter(s => s.stop_order > nearestStopOrder)
-            .slice(0, 5)
-            .map(s => s.name);
-
-        // Calculate update age
-        const ageSeconds = Math.floor((Date.now() - new Date(liveLocation.timestamp).getTime()) / 1000);
-        const isMoving = (liveLocation.speed || 0) > 2;
-        const status = isMoving ? `moving at ${liveLocation.speed} km/h` : 'stopped';
-
-        return {
-            success: true,
-            agentName: 'TrackerAgent',
-            data: {
-                bus_id: liveLocation.bus_id,
-                bus_name: vehicle?.name,
-                vehicle_number: vehicle?.vehicle_number,
-                latitude: liveLocation.latitude,
-                longitude: liveLocation.longitude,
-                speed: liveLocation.speed || 0,
-                heading: liveLocation.heading,
-                is_moving: isMoving,
-                nearest_stop: nearestStop?.name || 'Unknown',
-                distance_to_stop_km: Math.round(minDist * 100) / 100,
-                stops_ahead: stopsAhead,
-                last_update: liveLocation.timestamp,
-                age_seconds: ageSeconds,
-                is_fresh: ageSeconds < 120
-            },
-            message: `${vehicle?.name} (${vehicle?.vehicle_number}) is ${status} near ${nearestStop?.name}. Updated ${ageSeconds}s ago. ${stopsAhead.length} stops ahead.`,
-            confidence: ageSeconds < 120 ? 0.95 : 0.7,
-            toolsUsed: ['haversine', 'bus_tracking'],
-            executionTimeMs: Date.now() - startTime
-        };
-    }
-};
-
-const TimeAgent: Agent = {
-    name: 'TimeAgent',
-    description: 'Calculates ETA',
-    async execute(context: AgentContext, _input: AgentInput): Promise<AgentOutput> {
-        const startTime = Date.now();
-        trace(context, 'AGENT_STARTED', 'TimeAgent: Calculating ETA');
-
-        const bestRoute = getData<Record<string, unknown>>(context, 'best_route');
-        if (!bestRoute) {
-            return { success: false, agentName: 'TimeAgent', data: {}, error: 'No route data', confidence: 0, toolsUsed: [], executionTimeMs: Date.now() - startTime };
-        }
-
-        const eta = calculateETA(
-            bestRoute.distanceKm as number,
-            bestRoute.numStops as number,
-            undefined
-        );
-
-        return {
-            success: true,
-            agentName: 'TimeAgent',
-            data: {
-                eta_minutes: eta.etaMinutes,
-                eta_range_min: Math.round(eta.etaMinutes * 0.85),
-                eta_range_max: Math.round(eta.etaMinutes * 1.25),
-                traffic_factor: eta.trafficFactor
-            },
-            message: `ETA: ${Math.round(eta.etaMinutes * 0.85)}-${Math.round(eta.etaMinutes * 1.25)} min`,
-            confidence: 0.8,
-            toolsUsed: ['calculate_eta'],
-            executionTimeMs: Date.now() - startTime
-        };
-    }
-};
-
-const AnalyticsAgent: Agent = {
-    name: 'AnalyticsAgent',
-    description: 'Fleet analytics',
-    async execute(context: AgentContext, _input: AgentInput): Promise<AgentOutput> {
-        const startTime = Date.now();
-        trace(context, 'AGENT_STARTED', 'AnalyticsAgent: Analyzing fleet');
-
-        const vehicles = getData<Vehicle[]>(context, 'vehicles') || [];
-        const locations = getData<LiveLocation[]>(context, 'live_locations') || [];
-        const now = Date.now();
-        const fresh = locations.filter(l => (now - new Date(l.timestamp).getTime()) < 120000);
-
-        return {
-            success: true,
-            agentName: 'AnalyticsAgent',
-            data: { total_vehicles: vehicles.length, live_count: locations.length, fresh_count: fresh.length },
-            message: `Fleet: ${fresh.length} active, ${vehicles.length - locations.length} offline`,
-            confidence: 0.95,
-            toolsUsed: [],
-            executionTimeMs: Date.now() - startTime
-        };
-    }
-};
-
-// ============================================================================
-// USER CONTEXT AGENT - Handles user location and context queries
-// ============================================================================
-
-const UserContextAgent: Agent = {
-    name: 'UserContextAgent',
-    description: 'Handles user location, context, and nearby information',
-    async execute(context: AgentContext, input: AgentInput): Promise<AgentOutput> {
-        const startTime = Date.now();
-        trace(context, 'AGENT_STARTED', 'UserContextAgent: Processing user context');
-
-        const userLocation = context.userLocation;
-        const vehicles = getData<Vehicle[]>(context, 'vehicles') || [];
-        const stops = getData<RouteStop[]>(context, 'stops') || [];
-        const liveLocations = getData<LiveLocation[]>(context, 'live_locations') || [];
-
-        // Check if we have user's GPS
-        if (!userLocation) {
-            return {
-                success: false,
-                agentName: 'UserContextAgent',
-                data: { has_gps: false },
-                error: 'User location not available. Please enable GPS or share your location.',
-                message: 'GPS location required for this query',
-                confidence: 0,
-                toolsUsed: [],
-                executionTimeMs: Date.now() - startTime
-            };
-        }
-
-        // Find nearby stops (within 2km)
-        const nearbyStops: Array<{ name: string; distanceKm: number; vehicleName: string }> = [];
-        const vehicleMap = new Map(vehicles.map(v => [v.id, v]));
-
-        for (const stop of stops) {
-            const dist = haversineDistance(userLocation.latitude, userLocation.longitude, stop.latitude, stop.longitude);
-            if (dist <= 2.0) {
-                nearbyStops.push({
-                    name: stop.name,
-                    distanceKm: Math.round(dist * 1000) / 1000,
-                    vehicleName: vehicleMap.get(stop.vehicle_id)?.name || 'Unknown'
-                });
-            }
-        }
-        nearbyStops.sort((a, b) => a.distanceKm - b.distanceKm);
-
-        // Find nearby live buses (within 3km)
-        const nearbyBuses: Array<{ busName: string; distanceKm: number; speed: number; isMoving: boolean }> = [];
-        const now = Date.now();
-
-        for (const loc of liveLocations) {
-            // Only consider fresh locations (within 2 minutes)
-            const locAge = now - new Date(loc.timestamp).getTime();
-            if (locAge > 120000) continue;
-
-            const dist = haversineDistance(userLocation.latitude, userLocation.longitude, loc.latitude, loc.longitude);
-            if (dist <= 3.0) {
-                const vehicle = vehicleMap.get(loc.bus_id);
-                nearbyBuses.push({
-                    busName: vehicle?.name || loc.bus_id,
-                    distanceKm: Math.round(dist * 100) / 100,
-                    speed: loc.speed || 0,
-                    isMoving: (loc.speed || 0) > 2
-                });
-            }
-        }
-        nearbyBuses.sort((a, b) => a.distanceKm - b.distanceKm);
-
-        // Store in context for other agents
-        setData(context, 'user_nearby_stops', nearbyStops.slice(0, 5));
-        setData(context, 'user_nearby_buses', nearbyBuses.slice(0, 5));
-        setData(context, 'user_gps_available', true);
-
-        return {
-            success: true,
-            agentName: 'UserContextAgent',
-            data: {
-                has_gps: true,
-                user_lat: userLocation.latitude,
-                user_lng: userLocation.longitude,
-                nearby_stops_count: nearbyStops.length,
-                nearby_buses_count: nearbyBuses.length,
-                closest_stop: nearbyStops[0]?.name || 'None within 2km',
-                closest_stop_distance: nearbyStops[0]?.distanceKm || null,
-                closest_bus: nearbyBuses[0]?.busName || 'None within 3km',
-                closest_bus_distance: nearbyBuses[0]?.distanceKm || null,
-                nearby_stops: nearbyStops.slice(0, 3),
-                nearby_buses: nearbyBuses.slice(0, 3)
-            },
-            message: `Found ${nearbyStops.length} stops and ${nearbyBuses.length} live buses near you`,
-            confidence: 0.95,
-            toolsUsed: ['haversine', 'gps_context'],
-            executionTimeMs: Date.now() - startTime
-        };
-    }
-};
-
-// ============================================================================
-// MEMORY AGENT - RAG Context Retrieval
-// ============================================================================
-
-const EMBEDDING_DIMENSION = 1536;
-
-/**
- * Generate a deterministic hash-based embedding for RAG
- * (Falls back when OpenAI key is not available)
- */
-function generateHashEmbedding(text: string): number[] {
-    const embedding: number[] = new Array(EMBEDDING_DIMENSION).fill(0);
-    const normalized = text.toLowerCase().trim();
-
-    for (let i = 0; i < normalized.length; i++) {
-        const charCode = normalized.charCodeAt(i);
-        const idx = (i * 7 + charCode) % EMBEDDING_DIMENSION;
-        embedding[idx] += Math.sin(charCode * (i + 1)) * 0.1;
-    }
-
-    for (let i = 0; i < normalized.length - 1; i++) {
-        const bigram = normalized.substring(i, i + 2);
-        const hash = (bigram.charCodeAt(0) * 31 + bigram.charCodeAt(1)) % EMBEDDING_DIMENSION;
-        embedding[hash] += 0.05;
-    }
-
-    const magnitude = Math.sqrt(embedding.reduce((sum, val) => sum + val * val, 0));
-    if (magnitude > 0) {
-        for (let i = 0; i < EMBEDDING_DIMENSION; i++) {
-            embedding[i] /= magnitude;
-        }
-    }
-
-    return embedding;
-}
-
-/**
- * Generate embedding using OpenAI API if available
- */
-async function generateEmbedding(text: string): Promise<number[]> {
-    const openaiKey = Deno.env.get('OPENAI_API_KEY');
-
-    if (openaiKey) {
-        try {
-            const response = await fetch('https://api.openai.com/v1/embeddings', {
+            const response = await fetch(GROQ_API_URL, {
                 method: 'POST',
                 headers: {
-                    'Authorization': `Bearer ${openaiKey}`,
+                    'Authorization': `Bearer ${apiKey}`,
                     'Content-Type': 'application/json'
                 },
                 body: JSON.stringify({
-                    model: 'text-embedding-3-small',
-                    input: text
+                    model: GROQ_MODEL_FAST,
+                    messages: [
+                        { role: 'system', content: INTENT_ANALYSIS_PROMPT },
+                        { role: 'user', content: `Query: "${query}"` }
+                    ],
+                    temperature: 0.1,
+                    max_tokens: 300,
+                    response_format: { type: 'json_object' }
                 })
             });
 
             if (response.ok) {
                 const data = await response.json();
-                return data.data[0].embedding;
+                const content = data.choices[0]?.message?.content || '';
+                const parsed = JSON.parse(content);
+
+                const result: AnalyzedIntent = {
+                    primaryIntent: parsed.primaryIntent || 'GENERAL',
+                    subIntents: parsed.subIntents || [],
+                    entities: parsed.entities || {},
+                    confidence: parsed.confidence || 0.7,
+                    reasoning: `[AI] ${parsed.reasoning || ''}`
+                };
+
+                // Log confidence tier
+                const tier = getConfidenceTier(result.confidence);
+                console.log(`[Layer1] AI intent: ${result.primaryIntent} (${tier}, ${result.confidence.toFixed(2)})`);
+
+                return result;
             }
         } catch (error) {
-            console.warn('OpenAI embedding failed, using fallback:', error);
+            console.warn('[Layer1] AI intent analysis failed, using fallback:', error);
         }
     }
 
-    return generateHashEmbedding(text);
-}
+    // Deterministic fallback with pattern matching
+    const patternResult = analyzeIntentWithPatterns(query);
+    const patternTier = getConfidenceTier(patternResult.confidence);
 
-interface MemoryContext {
-    similarQueries: Array<{
-        query: string;
-        intent: string;
-        response: string;
-        similarity: number;
-    }>;
-    knowledgeContext: Array<{
-        content: string;
-        source: string;
-        similarity: number;
-    }>;
-    conversationHistory: Array<{
-        role: string;
-        content: string;
-    }>;
-}
+    console.log(`[Layer1] Pattern intent: ${patternResult.primaryIntent} (${patternTier}, ${patternResult.confidence.toFixed(2)})`);
 
-const MemoryAgent: Agent = {
-    name: 'MemoryAgent',
-    description: 'Retrieves relevant context from memory using RAG',
-    async execute(context: AgentContext, input: AgentInput): Promise<AgentOutput> {
-        const startTime = Date.now();
-        trace(context, 'AGENT_STARTED', 'MemoryAgent: Retrieving context via RAG');
+    // Check if we should retry with LLM for low-confidence patterns
+    const retryDecision = shouldRetryIntentWithLLM(
+        patternResult.confidence,
+        'pattern',
+        !!apiKey
+    );
 
-        const query = context.originalQuery;
-        const userId = context.userId;
-
+    if (retryDecision.shouldRetry && apiKey) {
+        console.log(`[Layer1] ${retryDecision.reason} - retrying with LLM`);
         try {
-            const client = getSupabase();
-
-            // Generate embedding for the query
-            const queryEmbedding = await generateEmbedding(query);
-            const embeddingStr = `[${queryEmbedding.join(',')}]`;
-
-            // Retrieve similar past queries
-            let similarQueries: MemoryContext['similarQueries'] = [];
-            try {
-                const { data: historyData } = await client.rpc('find_similar_queries', {
-                    query_embedding: embeddingStr,
-                    target_user_id: userId,
-                    match_count: 3
-                });
-
-                if (historyData) {
-                    similarQueries = historyData.map((row: any) => ({
-                        query: row.query,
-                        intent: row.intent,
-                        response: row.response,
-                        similarity: row.similarity
-                    }));
-                }
-            } catch (e) {
-                console.warn('Similar queries lookup failed:', e);
-            }
-
-            // Retrieve relevant knowledge
-            let knowledgeContext: MemoryContext['knowledgeContext'] = [];
-            try {
-                const { data: knowledgeData } = await client.rpc('match_knowledge', {
-                    query_embedding: embeddingStr,
-                    match_threshold: 0.6,
-                    match_count: 3,
-                    filter_namespace: null
-                });
-
-                if (knowledgeData) {
-                    knowledgeContext = knowledgeData.map((row: any) => ({
-                        content: row.content,
-                        source: row.source || 'knowledge_base',
-                        similarity: row.similarity
-                    }));
-                }
-            } catch (e) {
-                console.warn('Knowledge lookup failed:', e);
-            }
-
-            // Get recent conversation history
-            let conversationHistory: MemoryContext['conversationHistory'] = [];
-            try {
-                const { data: convData } = await client
-                    .from('conversation_memory')
-                    .select('role, content')
-                    .eq('user_id', userId)
-                    .order('created_at', { ascending: false })
-                    .limit(5);
-
-                if (convData) {
-                    conversationHistory = convData.reverse();
-                }
-            } catch (e) {
-                console.warn('Conversation history lookup failed:', e);
-            }
-
-            // Store context for other agents
-            const memoryContext: MemoryContext = {
-                similarQueries,
-                knowledgeContext,
-                conversationHistory
-            };
-
-            setData(context, 'memory_context', memoryContext);
-            setData(context, 'query_embedding', queryEmbedding);
-
-            const totalContext = similarQueries.length + knowledgeContext.length + conversationHistory.length;
-
-            return {
-                success: true,
-                agentName: 'MemoryAgent',
-                data: {
-                    similar_queries_count: similarQueries.length,
-                    knowledge_count: knowledgeContext.length,
-                    conversation_count: conversationHistory.length,
-                    has_relevant_context: totalContext > 0
+            // Retry with more explicit prompt for ambiguous queries
+            const retryResponse = await fetch(GROQ_API_URL, {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${apiKey}`,
+                    'Content-Type': 'application/json'
                 },
-                message: `Retrieved ${totalContext} context items via RAG`,
-                confidence: totalContext > 0 ? 0.8 : 0.5,
-                toolsUsed: ['vector_search', 'embedding_generation'],
-                executionTimeMs: Date.now() - startTime
-            };
-        } catch (error) {
-            console.error('MemoryAgent error:', error);
+                body: JSON.stringify({
+                    model: GROQ_MODEL_FAST,
+                    messages: [
+                        { role: 'system', content: INTENT_ANALYSIS_PROMPT + '\n\nNote: This is a retry for an ambiguous query. Be more careful with entity extraction.' },
+                        { role: 'user', content: `Query: "${query}"` }
+                    ],
+                    temperature: 0.2,
+                    max_tokens: 400,
+                    response_format: { type: 'json_object' }
+                })
+            });
+
+            if (retryResponse.ok) {
+                const data = await retryResponse.json();
+                const content = data.choices[0]?.message?.content || '';
+                const parsed = JSON.parse(content);
+
+                const retryResult: AnalyzedIntent = {
+                    primaryIntent: parsed.primaryIntent || patternResult.primaryIntent,
+                    subIntents: parsed.subIntents || patternResult.subIntents,
+                    entities: parsed.entities || patternResult.entities,
+                    confidence: Math.max(parsed.confidence || 0.6, patternResult.confidence),
+                    reasoning: `[AI-Retry] ${parsed.reasoning || patternResult.reasoning}`
+                };
+
+                console.log(`[Layer1] AI retry improved confidence: ${retryResult.confidence.toFixed(2)}`);
+                return retryResult;
+            }
+        } catch (retryError) {
+            console.warn('[Layer1] AI retry failed, using pattern result');
+        }
+    }
+
+    return patternResult;
+}
+
+function analyzeIntentWithPatterns(query: string): AnalyzedIntent {
+    const q = query.toLowerCase().trim();
+
+    // Check for vehicle reference first (high priority for tracking)
+    const vehicleRef = extractVehicleReference(query);
+    if (vehicleRef && /where|track|find|locate|status/i.test(q)) {
+        return {
+            primaryIntent: 'TRACK_BUS',
+            subIntents: [],
+            entities: { busName: vehicleRef },
+            confidence: 0.9,
+            reasoning: '[Pattern] Vehicle reference detected with tracking intent'
+        };
+    }
+
+    for (const { pattern, intent, priority } of INTENT_PATTERNS.sort((a, b) => b.priority - a.priority)) {
+        const match = q.match(pattern);
+        if (match) {
+            const entities: AnalyzedIntent['entities'] = {};
+
+            if (intent === 'FIND_ROUTE' && match.length >= 3) {
+                entities.origin = match[1]?.trim();
+                entities.destination = match[2]?.replace(/[?.!]$/g, '').trim();
+            } else if (intent === 'TRACK_BUS' && match[1]) {
+                entities.busName = match[1]?.trim();
+            }
+
+            // Extract preferences
+            if (/shortest|quickest|fastest/i.test(q)) {
+                entities.preferences = ['fastest'];
+            }
+
+            // Higher confidence for specific patterns
+            const confidence = priority >= 8 ? 0.85 : priority >= 5 ? 0.7 : 0.55;
+
             return {
-                success: false,
-                agentName: 'MemoryAgent',
-                data: {},
-                error: error instanceof Error ? error.message : 'Memory retrieval failed',
-                confidence: 0,
-                toolsUsed: [],
-                executionTimeMs: Date.now() - startTime
+                primaryIntent: intent,
+                subIntents: /alternative|other|different/i.test(q) ? ['alternative_options'] : [],
+                entities,
+                confidence,
+                reasoning: `[Pattern] Priority ${priority} match`
             };
         }
     }
-};
 
-// Agent registry
-const AGENTS: Record<string, Agent> = {
-    DataAgent,
-    AlgorithmAgent,
-    PathAgent,
-    TrackerAgent,
-    TimeAgent,
-    AnalyticsAgent,
-    UserContextAgent,
-    MemoryAgent
-};
+    // Default: try to extract destination from any remaining words
+    const words = q.split(/\s+/).filter(w => w.length > 2 && !/^(how|can|i|do|the|a|to|from|get|go|is)$/i.test(w));
+    if (words.length > 0) {
+        return {
+            primaryIntent: 'FIND_ROUTE',
+            subIntents: [],
+            entities: { destination: words.join(' ') },
+            confidence: 0.35,  // Below LOW threshold - will trigger LLM retry
+            reasoning: '[Fallback] Word extraction - low confidence'
+        };
+    }
+
+    return {
+        primaryIntent: 'GENERAL',
+        subIntents: [],
+        entities: {},
+        confidence: 0.5,
+        reasoning: '[Fallback] Default'
+    };
+}
 
 // ============================================================================
-// CORS
+// LAYER 2: LOCATION FILTER (3km Radius)
+// ============================================================================
+
+/**
+ * Filter all stops to only those within 3km of user's LATEST location
+ * Formula: FilteredStops = { s ∈ AllStops | d(user, s) ≤ 3km }
+ */
+function filterStopsBy3kmRadius(
+    userLat: number,
+    userLng: number,
+    stops: RouteStop[],
+    vehicles: Vehicle[]
+): FilteredStop[] {
+    const vehicleMap = new Map(vehicles.map(v => [v.id, v]));
+    const filtered: FilteredStop[] = [];
+
+    for (const stop of stops) {
+        const distanceKm = haversineDistance(userLat, userLng, stop.latitude, stop.longitude);
+
+        if (distanceKm <= FILTER_RADIUS_KM) {
+            const vehicle = vehicleMap.get(stop.vehicle_id);
+            filtered.push({
+                stop,
+                distanceKm: Math.round(distanceKm * 1000) / 1000,
+                walkTimeMinutes: calculateWalkTime(distanceKm),
+                vehicleName: vehicle?.name || 'Unknown',
+                vehicleId: stop.vehicle_id
+            });
+        }
+    }
+
+    return filtered;
+}
+
+// ============================================================================
+// LAYER 3: NEAREST STOP SELECTION (KNN)
+// ============================================================================
+
+/**
+ * K-Nearest Neighbors Algorithm
+ * Find K nearest stops to user, sorted by distance
+ */
+function knnNearestStops(filteredStops: FilteredStop[], k: number = 5): FilteredStop[] {
+    return [...filteredStops]
+        .sort((a, b) => a.distanceKm - b.distanceKm)
+        .slice(0, k);
+}
+
+/**
+ * Find alternative stops based on intent
+ * If user wants alternatives, return stops serving different routes
+ */
+function findAlternativeStops(
+    nearestStops: FilteredStop[],
+    intent: AnalyzedIntent
+): FilteredStop[] {
+    if (!intent.subIntents.includes('alternative_options')) {
+        return [];
+    }
+
+    // Get unique vehicle IDs from top 3 nearest
+    const topVehicleIds = new Set(nearestStops.slice(0, 3).map(s => s.vehicleId));
+
+    // Find stops from DIFFERENT vehicles as alternatives
+    return nearestStops
+        .filter(s => !topVehicleIds.has(s.vehicleId))
+        .slice(0, 3);
+}
+
+// ============================================================================
+// LAYER 4: BUS FILTERING (LATEST Coordinates Only)
+// ============================================================================
+
+/**
+ * Get ONLY the LATEST location for each bus
+ * Uses timestamp to ensure freshness
+ */
+function getLatestBusLocations(locations: LiveLocation[]): Map<string, LiveLocation> {
+    const latestMap = new Map<string, LiveLocation>();
+
+    for (const loc of locations) {
+        const existing = latestMap.get(loc.bus_id);
+        if (!existing || loc.timestamp > existing.timestamp) {
+            latestMap.set(loc.bus_id, loc);
+        }
+    }
+
+    return latestMap;
+}
+
+/**
+ * Filter buses that pass through the selected stops
+ * Only uses LATEST coordinates at time of asking
+ */
+function filterBusesByStops(
+    nearestStops: FilteredStop[],
+    vehicles: Vehicle[],
+    latestLocations: Map<string, LiveLocation>,
+    allStops: RouteStop[]
+): FilteredBus[] {
+    const now = Date.now();
+    const vehicleIdsNeeded = new Set(nearestStops.map(s => s.vehicleId));
+    const filtered: FilteredBus[] = [];
+
+    for (const vehicle of vehicles) {
+        if (!vehicleIdsNeeded.has(vehicle.id)) continue;
+
+        const latestLocation = latestLocations.get(vehicle.id);
+        if (!latestLocation) continue;
+
+        // Find nearest stop to current bus position
+        const vehicleStops = allStops
+            .filter(s => s.vehicle_id === vehicle.id)
+            .sort((a, b) => a.stop_order - b.stop_order);
+
+        let nearestStop: RouteStop | null = null;
+        let minDist = Infinity;
+
+        for (const stop of vehicleStops) {
+            const dist = haversineDistance(
+                latestLocation.latitude, latestLocation.longitude,
+                stop.latitude, stop.longitude
+            );
+            if (dist < minDist) {
+                minDist = dist;
+                nearestStop = stop;
+            }
+        }
+
+        // Calculate stops away from user's nearest stop for this vehicle
+        const userStop = nearestStops.find(ns => ns.vehicleId === vehicle.id);
+        const stopsAway = nearestStop && userStop
+            ? Math.abs(userStop.stop.stop_order - nearestStop.stop_order)
+            : 0;
+
+        const ageSeconds = Math.floor((now - latestLocation.timestamp) / 1000);
+        const isMoving = (latestLocation.speed || 0) > 2;
+
+        filtered.push({
+            vehicle,
+            latestLocation,
+            nearestStop,
+            stopsAwayFromUser: stopsAway,
+            etaMinutes: calculateETA(minDist, stopsAway, latestLocation.speed || undefined),
+            isMoving,
+            ageSeconds
+        });
+    }
+
+    // Sort by ETA (closest arriving first)
+    return filtered.sort((a, b) => a.etaMinutes - b.etaMinutes);
+}
+
+// ============================================================================
+// LAYER 5: AI RESPONSE (Grounded, No Hallucination)
+// ============================================================================
+
+const GROUNDED_RESPONSE_PROMPT = `You are Sahara - a friendly, conversational bus travel assistant
+
+YOUR PERSONALITY:
+- Speak naturally like a helpful local friend
+- Be warm but concise - answer in 4-5 sentences with key bullet points
+- Sound confident when data is fresh, cautious when data is stale
+
+CRITICAL GROUNDING RULES:
+1. ONLY use information from the PROVIDED DATA - never invent anything
+2. If the data shows something, state it as fact
+3. If data is missing or stale, honestly say so
+4. Adapt your tone based on data freshness (LIVE=confident, STALE=cautious)
+5. CONFIDENCE ENFORCEMENT: If confidence < 60%, explicitly say "this may not be exact" or "I'm not fully certain"
+
+RESPONSE STRUCTURE:
+Start with a brief friendly summary, then list:
+• Key fact 1 (bus name, route, ETA)
+• Key fact 2 (walk time, stops away)
+• Optional: Alternative if available
+
+USE THESE INDICATORS:
+🚌 = bus route/name | 📍 = location/stop | ⏱️ = time/ETA | 🚶 = walking | 🟢 = live/active | 🔴 = stopped/offline
+
+Be helpful, be honest, be brief.`;
+
+async function generateGroundedResponse(
+    query: string,
+    ctx: PipelineContext
+): Promise<string> {
+    // Build grounded context from pipeline data
+    const groundedData: string[] = ['=== PROVIDED DATA (Use ONLY this) ==='];
+
+    // Best route - only include for FIND_ROUTE intent
+    if (ctx.bestRoute && ctx.intent?.primaryIntent === 'FIND_ROUTE') {
+        groundedData.push(`\nBEST ROUTE FOUND:`);
+        groundedData.push(`  Bus: "${ctx.bestRoute.vehicleName}" (${ctx.bestRoute.vehicleNumber})`);
+        groundedData.push(`  Path: ${ctx.bestRoute.originStop} → ${ctx.bestRoute.destinationStop}`);
+        groundedData.push(`  Distance: ${ctx.bestRoute.distanceKm} km`);
+        groundedData.push(`  ETA: ${ctx.bestRoute.etaMinutes} minutes`);
+        groundedData.push(`  Data Freshness: ${ctx.bestRoute.isLive ? 'LIVE' : 'STALE'}`);
+        groundedData.push(`  Stops: ${ctx.bestRoute.stopsInPath.join(' → ')}`);
+        if (ctx.bestRoute.walkTimeMinutes) {
+            groundedData.push(`  Walk to stop: ${ctx.bestRoute.walkDistanceMeters}m (${ctx.bestRoute.walkTimeMinutes} min)`);
+        }
+        if (ctx.bestRoute.isLive && ctx.bestRoute.busStopsAway !== undefined) {
+            groundedData.push(`  Bus is ${ctx.bestRoute.busStopsAway} stops away from pickup`);
+        }
+    }
+
+    // Alternatives - only include for FIND_ROUTE intent
+    if (ctx.alternatives && ctx.alternatives.length > 0 && ctx.intent?.primaryIntent === 'FIND_ROUTE') {
+        groundedData.push(`\nALTERNATIVES:`);
+        for (const alt of ctx.alternatives.slice(0, 2)) {
+            groundedData.push(`  - ${alt.vehicleName}: ${alt.etaMinutes} min, ${alt.distanceKm} km`);
+        }
+    }
+
+    // Nearby stops - only include for FIND_NEARBY or FIND_ROUTE intents
+    if (ctx.nearestStops && ctx.nearestStops.length > 0 &&
+        (ctx.intent?.primaryIntent === 'FIND_NEARBY' || ctx.intent?.primaryIntent === 'FIND_ROUTE')) {
+        groundedData.push(`\nNEARBY STOPS (within 3km):`);
+        for (const ns of ctx.nearestStops.slice(0, 3)) {
+            groundedData.push(`  - ${ns.stop.name} (${ns.vehicleName}): ${(ns.distanceKm * 1000).toFixed(0)}m, ${ns.walkTimeMinutes} min walk`);
+        }
+    }
+
+    // Tracked bus with enhanced data
+    if (ctx.filteredBuses && ctx.filteredBuses.length > 0 && ctx.intent?.primaryIntent === 'TRACK_BUS') {
+        const bus = ctx.filteredBuses[0];
+        const freshness = calculateLocationFreshness(bus.latestLocation);
+        const headingDir = getHeadingDirection(bus.latestLocation.heading);
+
+        groundedData.push(`\nTRACKED BUS:`);
+        groundedData.push(`  Bus: "${bus.vehicle.name}" (${bus.vehicle.vehicle_number})`);
+        groundedData.push(`  Status: ${bus.isMoving ? 'MOVING' : 'STOPPED'} at ${bus.latestLocation.speed || 0} km/h`);
+        if (headingDir) {
+            groundedData.push(`  Heading: ${headingDir}`);
+        }
+        groundedData.push(`  Trip Status: ${bus.latestLocation.trip_status || 'unknown'}`);
+        groundedData.push(`  Near: ${bus.nearestStop?.name || 'Unknown'}`);
+        groundedData.push(`  Data Freshness: ${freshness.status.toUpperCase()} (${freshness.ageSeconds}s ago)`);
+        groundedData.push(`  Confidence: ${Math.round(freshness.freshnessScore * 100)}%`);
+    }
+
+    // Geocoded places
+    if (ctx.geocodedPlaces) {
+        if (ctx.geocodedPlaces.userLocation) {
+            groundedData.push(`\nUSER LOCATION: ${ctx.geocodedPlaces.userLocation}`);
+        }
+    }
+
+    // Walking directions - only include for FIND_ROUTE or FIND_NEARBY intents
+    if (ctx.walkingDirections &&
+        (ctx.intent?.primaryIntent === 'FIND_ROUTE' || ctx.intent?.primaryIntent === 'FIND_NEARBY')) {
+        groundedData.push(`\nWALKING DIRECTIONS TO BUS STOP:`);
+        groundedData.push(`  Destination: ${ctx.walkingDirections.destinationStop}`);
+        groundedData.push(`  Distance: ${ctx.walkingDirections.distanceMeters}m`);
+        groundedData.push(`  Duration: ${ctx.walkingDirections.durationMinutes} min walk`);
+        groundedData.push(`  Summary: ${ctx.walkingDirections.summary}`);
+        if (ctx.walkingDirections.steps && ctx.walkingDirections.steps.length > 0) {
+            groundedData.push(`  Steps:`);
+            ctx.walkingDirections.steps.slice(0, 5).forEach((step, i) => {
+                groundedData.push(`    ${i + 1}. ${step.instruction} (${step.distance}m)`);
+            });
+            if (ctx.walkingDirections.steps.length > 5) {
+                groundedData.push(`    ... and ${ctx.walkingDirections.steps.length - 5} more steps`);
+            }
+        }
+    }
+
+    // Arrival predictions - only include for TRACK_BUS or FIND_ROUTE intents
+    const predictions = (ctx as unknown as { arrivalPredictions?: ArrivalPrediction[] }).arrivalPredictions;
+    if (predictions && predictions.length > 0 &&
+        (ctx.intent?.primaryIntent === 'TRACK_BUS' || ctx.intent?.primaryIntent === 'FIND_ROUTE')) {
+        groundedData.push(`\nBUS ARRIVAL PREDICTIONS:`);
+        for (const pred of predictions.slice(0, 3)) {
+            const statusIcon = pred.isApproaching ? '🟢 APPROACHING' : '';
+            groundedData.push(`  - ${pred.vehicleName}: ~${pred.predictedArrivalMinutes} min to ${pred.stopName} ${statusIcon}`);
+            groundedData.push(`    Confidence: ${Math.round(pred.confidence * 100)}% (${pred.basedOn})`);
+        }
+    }
+
+    groundedData.push('\n=== END DATA ===');
+    groundedData.push(`\nUser Query: "${query}"`);
+    groundedData.push('\nGenerate a helpful, natural response using ONLY the data above. Be conversational but concise. Use bullet points for key facts.');
+
+    // Try Groq first (faster), then Gemini as fallback
+    const groqKey = Deno.env.get('GROQ_API_KEY');
+    const geminiKey = Deno.env.get('GEMINI_API_KEY');
+
+    if (groqKey) {
+        try {
+            const response = await fetch(GROQ_API_URL, {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${groqKey}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    model: GROQ_MODEL_QUALITY,
+                    messages: [
+                        { role: 'system', content: GROUNDED_RESPONSE_PROMPT },
+                        { role: 'user', content: groundedData.join('\n') }
+                    ],
+                    temperature: 0.2,
+                    max_tokens: 500
+                })
+            });
+
+            if (response.ok) {
+                const data = await response.json();
+                return data.choices[0]?.message?.content?.trim() || generateFallbackResponse(ctx);
+            }
+        } catch (e) {
+            console.warn('[Layer5] Groq failed:', e);
+        }
+    }
+
+    if (geminiKey) {
+        try {
+            const response = await fetch(`${GEMINI_API_URL}/${GEMINI_MODEL}:generateContent`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'x-goog-api-key': geminiKey
+                },
+                body: JSON.stringify({
+                    contents: [{ parts: [{ text: `${GROUNDED_RESPONSE_PROMPT}\n\n${groundedData.join('\n')}` }], role: 'user' }],
+                    generationConfig: { temperature: 0.3, maxOutputTokens: 500 }
+                })
+            });
+
+            if (response.ok) {
+                const data = await response.json();
+                return data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || generateFallbackResponse(ctx);
+            }
+        } catch (e) {
+            console.warn('[Layer5] Gemini failed:', e);
+        }
+    }
+
+    return generateFallbackResponse(ctx);
+}
+
+function generateFallbackResponse(ctx: PipelineContext): string {
+    if (ctx.bestRoute) {
+        const r = ctx.bestRoute;
+        let msg = `🚌 **${r.vehicleName}** • ${r.distanceKm} km • ~${r.etaMinutes} min`;
+        if (r.walkTimeMinutes) {
+            msg += `\n🚶 Walk ${r.walkDistanceMeters}m to ${r.originStop}`;
+        }
+        if (r.isLive && r.busStopsAway !== undefined) {
+            msg += `\n📍 Bus is ${r.busStopsAway} stops away`;
+        }
+        return msg;
+    }
+
+    if (ctx.nearestStops && ctx.nearestStops.length > 0) {
+        const nearest = ctx.nearestStops[0];
+        let msg = `📍 Nearest stop: **${nearest.stop.name}** (${nearest.vehicleName})\n🚶 ${(nearest.distanceKm * 1000).toFixed(0)}m away, ${nearest.walkTimeMinutes} min walk`;
+
+        // Add walking directions if available
+        if (ctx.walkingDirections && ctx.walkingDirections.steps.length > 0) {
+            msg += '\n\n**Walking Directions:**';
+            ctx.walkingDirections.steps.slice(0, 3).forEach((step, i) => {
+                msg += `\n${i + 1}. ${step.instruction} (${step.distance}m)`;
+            });
+        }
+        return msg;
+    }
+
+    return 'I could not find the information you requested. Please try again with more details.';
+}
+
+// ============================================================================
+// DATA AGENT - Optimized with Caching \u0026 RPC (30-40s freshness)
+// ============================================================================
+
+// Simple in-memory cache using Map
+interface CacheEntry<T> {
+    data: T;
+    timestamp: number;
+    ttl: number;
+}
+
+class DataCache {
+    private cache = new Map<string, CacheEntry<unknown>>();
+
+    set<T>(key: string, data: T, ttl: number): void {
+        this.cache.set(key, {
+            data,
+            timestamp: Date.now(),
+            ttl
+        });
+    }
+
+    get<T>(key: string): T | null {
+        const entry = this.cache.get(key) as CacheEntry<T> | undefined;
+        if (!entry) return null;
+
+        // Check if expired
+        if (Date.now() - entry.timestamp > entry.ttl) {
+            this.cache.delete(key);
+            return null;
+        }
+
+        return entry.data;
+    }
+
+    isFresh(key: string): boolean {
+        const entry = this.cache.get(key);
+        if (!entry) return false;
+        return Date.now() - entry.timestamp <= entry.ttl;
+    }
+}
+
+const dataCache = new DataCache();
+
+async function fetchLatestData(ctx: PipelineContext): Promise<AgentOutput> {
+    const startTime = Date.now();
+
+    try {
+        const client = getSupabase();
+
+        // 1. Get vehicles from cache (5 min TTL) or fetch
+        if (dataCache.isFresh('vehicles')) {
+            ctx.vehicles = dataCache.get('vehicles') || [];
+            console.log('[DataAgent] Using cached vehicles:', ctx.vehicles.length);
+        } else {
+            const vehiclesRes = await client.from('vehicles')
+                .select('id, name, vehicle_number, is_active')
+                .eq('is_active', true);
+            ctx.vehicles = (vehiclesRes.data || []) as Vehicle[];
+            dataCache.set('vehicles', ctx.vehicles, 5 * 60 * 1000); // 5 min cache
+            console.log('[DataAgent] Fetched fresh vehicles:', ctx.vehicles.length);
+        }
+
+        // 2. Get LATEST locations using RPC with DISTINCT ON (40 second freshness)
+        const { data: locationsData, error: locError } = await client.rpc(
+            'get_latest_bus_locations',
+            { freshness_seconds: 40 }
+        );
+
+        if (locError) {
+            console.warn('[DataAgent] RPC get_latest_bus_locations failed, falling back:', locError);
+            // Fallback to manual DISTINCT ON via timestamp
+            const fallbackLoc = await client.from('locations')
+                .select('bus_id, latitude, longitude, speed, heading, timestamp, trip_status, accuracy')
+                .gt('timestamp', Date.now() - 40000) // 40 seconds
+                .order('timestamp', { ascending: false });
+
+            const allLocs = (fallbackLoc.data || []) as LiveLocation[];
+            ctx.latestLocations = Array.from(getLatestBusLocations(allLocs).values());
+        } else {
+            ctx.latestLocations = (locationsData || []) as LiveLocation[];
+        }
+
+        console.log('[DataAgent] Latest locations (40s freshness):', ctx.latestLocations.length);
+
+        // 3. Get route stops filtered by 3km radius using RPC
+        if (ctx.userLocation) {
+            const { data: stopsData, error: stopsError } = await client.rpc(
+                'get_nearby_stops',
+                {
+                    user_lat: ctx.userLocation.latitude,
+                    user_lng: ctx.userLocation.longitude,
+                    radius_km: 3.0
+                }
+            );
+
+            if (stopsError) {
+                console.warn('[DataAgent] RPC get_nearby_stops failed, fetching all:', stopsError);
+                // Fallback: fetch all stops (will be filtered in Layer 2)
+                const fallbackStops = await client.from('route_stops')
+                    .select('id, vehicle_id, name, latitude, longitude, stop_order')
+                    .order('vehicle_id')
+                    .order('stop_order');
+                ctx.allStops = (fallbackStops.data || []) as RouteStop[];
+            } else {
+                ctx.allStops = (stopsData || []) as RouteStop[];
+                console.log(`[DataAgent] Nearby stops (3km radius): ${ctx.allStops.length}`);
+            }
+        } else {
+            // No user location - fetch all stops (less optimal)
+            console.log('[DataAgent] No user location, fetching all active stops');
+            const allStopsRes = await client.from('route_stops')
+                .select('id, vehicle_id, name, latitude, longitude, stop_order')
+                .in('vehicle_id', ctx.vehicles.map(v => v.id))
+                .order('vehicle_id')
+                .order('stop_order');
+            ctx.allStops = (allStopsRes.data || []) as RouteStop[];
+        }
+
+        // Calculate data health metrics
+        const liveLocations = ctx.latestLocations.filter(l => {
+            const ageSeconds = (Date.now() - l.timestamp) / 1000;
+            return ageSeconds < 40;
+        }).length;
+
+        const activeTripsBuses = ctx.latestLocations.filter(l => l.trip_status === 'started').length;
+
+        return {
+            success: true,
+            agentName: 'DataAgent',
+            data: {
+                vehiclesCount: ctx.vehicles.length,
+                stopsCount: ctx.allStops.length,
+                liveLocationsCount: ctx.latestLocations.length,
+                liveBusesCount: liveLocations,
+                activeTripsBuses,
+                dataHealth: liveLocations / Math.max(1, ctx.vehicles.length),
+                freshnessWindow: '40 seconds',
+                radiusKm: ctx.userLocation ? 3.0 : null,
+                cached: dataCache.isFresh('vehicles')
+            },
+            message: `Fetched ${ctx.vehicles.length} vehicles, ${ctx.latestLocations.length} locations (${liveLocations} live), ${ctx.allStops.length} stops`,
+            confidence: liveLocations / Math.max(1, ctx.vehicles.length),
+            executionTimeMs: Date.now() - startTime
+        };
+    } catch (error) {
+        console.error('[DataAgent] Error:', error);
+        return {
+            success: false,
+            agentName: 'DataAgent',
+            data: { error: error instanceof Error ? error.message : 'Unknown error' },
+            error: 'Failed to fetch data',
+            confidence: 0,
+            executionTimeMs: Date.now() - startTime
+        };
+    }
+}
+
+// ============================================================================
+// MEMORY AGENT - RAG Context Retrieval (Kept as requested)
+// ============================================================================
+
+async function retrieveMemoryContext(ctx: PipelineContext): Promise<AgentOutput> {
+    const startTime = Date.now();
+
+    try {
+        const client = getSupabase();
+
+        // Keyword-based search for similar past queries
+        const queryWords = ctx.query.toLowerCase()
+            .split(/\s+/)
+            .filter(w => w.length > 3 && !['what', 'where', 'when', 'from', 'that', 'this'].includes(w));
+
+        if (queryWords.length > 0) {
+            const orFilter = queryWords.map(w => `query.ilike.%${w}%`).join(',');
+
+            const { data: matches } = await client
+                .from('search_history')
+                .select('query, intent, response')
+                .eq('user_id', ctx.userId)
+                .eq('success', true)
+                .or(orFilter)
+                .order('created_at', { ascending: false })
+                .limit(3);
+
+            if (matches && matches.length > 0) {
+                ctx.memoryContext = {
+                    similarQueries: matches.map(m => ({
+                        query: m.query,
+                        intent: m.intent,
+                        response: m.response,
+                        similarity: 0.7 // Keyword match estimate
+                    }))
+                };
+
+                return {
+                    success: true,
+                    agentName: 'MemoryAgent',
+                    data: { similarQueries: matches.length },
+                    message: `Found ${matches.length} similar past queries`,
+                    confidence: 0.8,
+                    executionTimeMs: Date.now() - startTime
+                };
+            }
+        }
+
+        return {
+            success: true,
+            agentName: 'MemoryAgent',
+            data: { similarQueries: 0 },
+            message: 'No similar queries found',
+            confidence: 0.5,
+            executionTimeMs: Date.now() - startTime
+        };
+    } catch (error) {
+        return {
+            success: false,
+            agentName: 'MemoryAgent',
+            data: {},
+            error: error instanceof Error ? error.message : 'Memory retrieval failed',
+            confidence: 0,
+            executionTimeMs: Date.now() - startTime
+        };
+    }
+}
+
+// ============================================================================
+// ROUTE AGENT - Path Finding + ETA (Merged PathAgent + TimeAgent)
+// ============================================================================
+
+async function findRoutes(ctx: PipelineContext): Promise<AgentOutput> {
+    const startTime = Date.now();
+
+    if (!ctx.intent || !ctx.vehicles || !ctx.allStops) {
+        return {
+            success: false,
+            agentName: 'RouteAgent',
+            data: {},
+            error: 'Missing required data',
+            confidence: 0,
+            executionTimeMs: Date.now() - startTime
+        };
+    }
+
+    const { origin, destination } = ctx.intent.entities;
+
+    if (!origin && !destination) {
+        return {
+            success: false,
+            agentName: 'RouteAgent',
+            data: {},
+            error: 'No origin or destination provided',
+            confidence: 0,
+            executionTimeMs: Date.now() - startTime
+        };
+    }
+
+    const latestLocations = getLatestBusLocations(ctx.latestLocations || []);
+    const matchedRoutes: RouteResult[] = [];
+
+    for (const vehicle of ctx.vehicles) {
+        const vehicleStops = ctx.allStops
+            .filter(s => s.vehicle_id === vehicle.id)
+            .sort((a, b) => a.stop_order - b.stop_order);
+
+        // Find origin and destination stops on this route
+        const originStop = destination
+            ? vehicleStops.find(s => s.name.toLowerCase().includes((origin || '').toLowerCase()))
+            : vehicleStops[0]; // If no origin, use first stop
+
+        const destStop = vehicleStops.find(s =>
+            s.name.toLowerCase().includes((destination || '').toLowerCase())
+        );
+
+        if (!destStop) continue;
+        if (originStop && destStop.stop_order <= originStop.stop_order) continue; // Wrong direction
+
+        const stopsInPath = vehicleStops.filter(s =>
+            s.stop_order >= (originStop?.stop_order || 0) &&
+            s.stop_order <= destStop.stop_order
+        );
+
+        // Calculate distance along route
+        let distance = 0;
+        for (let i = 0; i < stopsInPath.length - 1; i++) {
+            distance += haversineDistance(
+                stopsInPath[i].latitude, stopsInPath[i].longitude,
+                stopsInPath[i + 1].latitude, stopsInPath[i + 1].longitude
+            );
+        }
+
+        const liveLocation = latestLocations.get(vehicle.id);
+        const etaMinutes = calculateETA(distance, stopsInPath.length - 1, liveLocation?.speed || undefined);
+
+        // ISSUE 4 FIX: Freshness-aware isLive (live data can be stale/inaccurate)
+        let isLive = false;
+        let freshnessScore = 0;
+        if (liveLocation) {
+            const freshness = calculateLocationFreshness(liveLocation);
+            // Only consider "live" if data is fresh AND reasonably accurate
+            isLive = freshness.status === 'live' && (liveLocation.accuracy ?? 100) < 50;
+            freshnessScore = freshness.freshnessScore;
+        }
+
+        // Calculate bus position on route
+        let busStopsAway: number | undefined;
+        if (liveLocation && originStop) {
+            let minDist = Infinity;
+            let currentStopOrder = 0;
+            for (const s of vehicleStops) {
+                const d = haversineDistance(liveLocation.latitude, liveLocation.longitude, s.latitude, s.longitude);
+                if (d < minDist) { minDist = d; currentStopOrder = s.stop_order; }
+            }
+            busStopsAway = Math.max(0, originStop.stop_order - currentStopOrder);
+        }
+
+        // Calculate walk time if user has location
+        let walkTimeMinutes: number | undefined;
+        let walkDistanceMeters: number | undefined;
+        if (ctx.userLocation && originStop) {
+            const walkDist = haversineDistance(
+                ctx.userLocation.latitude, ctx.userLocation.longitude,
+                originStop.latitude, originStop.longitude
+            );
+            walkTimeMinutes = calculateWalkTime(walkDist);
+            walkDistanceMeters = Math.round(walkDist * 1000);
+        }
+
+        // Route score for smarter sorting (future-ready)
+        // Higher score = better route. Live bonus + shorter ETA bonus
+        const routeScore = (isLive ? 100 : 0) + Math.max(0, 60 - etaMinutes) + (freshnessScore * 20);
+
+        matchedRoutes.push({
+            vehicleId: vehicle.id,
+            vehicleName: vehicle.name,
+            vehicleNumber: vehicle.vehicle_number,
+            originStop: originStop?.name || vehicleStops[0]?.name || 'Start',
+            destinationStop: destStop.name,
+            distanceKm: Math.round(distance * 10) / 10,
+            etaMinutes,
+            stopsInPath: stopsInPath.map(s => s.name),
+            isLive,
+            busStopsAway,
+            walkTimeMinutes,
+            walkDistanceMeters,
+            routeScore // Added for future sorting
+        });
+    }
+
+    // Sort by routeScore (higher = better) - combines live status, ETA, and freshness
+    matchedRoutes.sort((a, b) => (b.routeScore ?? 0) - (a.routeScore ?? 0));
+
+    if (matchedRoutes.length === 0) {
+        return {
+            success: false,
+            agentName: 'RouteAgent',
+            data: { routeFound: false },
+            error: 'No direct route found',
+            confidence: 0,
+            executionTimeMs: Date.now() - startTime
+        };
+    }
+
+    ctx.bestRoute = matchedRoutes[0];
+    ctx.alternatives = matchedRoutes.slice(1, 3);
+
+    // ISSUE 3 FIX: Dynamic confidence based on data quality
+    const liveRoutesCount = matchedRoutes.filter(r => r.isLive).length;
+    const hasWalkingData = !!ctx.bestRoute.walkTimeMinutes;
+    const baseConfidence = 0.5;
+    const liveBonus = (liveRoutesCount / matchedRoutes.length) * 0.3; // Up to 0.3 for all live
+    const walkBonus = hasWalkingData ? 0.1 : 0;
+    const routeCountBonus = Math.min(matchedRoutes.length * 0.05, 0.1); // Up to 0.1 for multiple routes
+    const dynamicConfidence = Math.min(baseConfidence + liveBonus + walkBonus + routeCountBonus, 0.95);
+
+    return {
+        success: true,
+        agentName: 'RouteAgent',
+        data: {
+            routeFound: true,
+            routesCount: matchedRoutes.length,
+            liveRoutesCount,
+            bestRoute: ctx.bestRoute.vehicleName,
+            eta: ctx.bestRoute.etaMinutes,
+            routeScore: ctx.bestRoute.routeScore
+        },
+        message: `Found ${matchedRoutes.length} routes (${liveRoutesCount} live), best: ${ctx.bestRoute.vehicleName} (${ctx.bestRoute.etaMinutes} min)`,
+        confidence: dynamicConfidence,
+        executionTimeMs: Date.now() - startTime
+    };
+}
+
+// ============================================================================
+// TRACKER AGENT - Bus Tracking (Kept as requested)
+// ============================================================================
+
+async function trackBus(ctx: PipelineContext): Promise<AgentOutput> {
+    const startTime = Date.now();
+
+    if (!ctx.intent || !ctx.vehicles || !ctx.latestLocations) {
+        return {
+            success: false,
+            agentName: 'TrackerAgent',
+            data: {},
+            error: 'Missing required data',
+            confidence: 0,
+            executionTimeMs: Date.now() - startTime
+        };
+    }
+
+    const targetBusName = ctx.intent.entities.busName || ctx.intent.entities.busNumber;
+    if (!targetBusName) {
+        return {
+            success: false,
+            agentName: 'TrackerAgent',
+            data: {},
+            error: 'No bus name or number provided',
+            confidence: 0,
+            executionTimeMs: Date.now() - startTime
+        };
+    }
+
+    // Find matching vehicle
+    const vehicle = ctx.vehicles.find(v =>
+        v.name.toLowerCase().includes(targetBusName.toLowerCase()) ||
+        v.vehicle_number.toLowerCase().includes(targetBusName.toLowerCase())
+    );
+
+    if (!vehicle) {
+        return {
+            success: false,
+            agentName: 'TrackerAgent',
+            data: { activeBuses: ctx.vehicles.slice(0, 5).map(v => v.name) },
+            error: `Bus "${targetBusName}" not found`,
+            confidence: 0,
+            executionTimeMs: Date.now() - startTime
+        };
+    }
+
+    const latestLocation = ctx.latestLocations.find(l => l.bus_id === vehicle.id);
+    if (!latestLocation) {
+        return {
+            success: false,
+            agentName: 'TrackerAgent',
+            data: { bus: vehicle.name },
+            error: `Bus "${vehicle.name}" is not currently broadcasting location`,
+            confidence: 0,
+            executionTimeMs: Date.now() - startTime
+        };
+    }
+
+    // Find nearest stop
+    const vehicleStops = (ctx.allStops || [])
+        .filter(s => s.vehicle_id === vehicle.id)
+        .sort((a, b) => a.stop_order - b.stop_order);
+
+    let nearestStop: RouteStop | null = null;
+    let minDist = Infinity;
+    for (const s of vehicleStops) {
+        const d = haversineDistance(latestLocation.latitude, latestLocation.longitude, s.latitude, s.longitude);
+        if (d < minDist) { minDist = d; nearestStop = s; }
+    }
+
+    const ageSeconds = Math.floor((Date.now() - latestLocation.timestamp) / 1000);
+    const isMoving = (latestLocation.speed || 0) > 2;
+    const freshness = calculateLocationFreshness(latestLocation);
+    const headingDir = getHeadingDirection(latestLocation.heading);
+
+    // Find the best stop to catch the bus (ahead of current bus position + near user)
+    let bestCatchStop: RouteStop | null = null;
+    let userWalkDistanceKm = Infinity;
+    let stopsAwayFromBus = 0;
+
+    if (ctx.userLocation && nearestStop) {
+        const busStopOrder = nearestStop.stop_order;
+        for (const stop of vehicleStops) {
+            if (stop.stop_order > busStopOrder) {
+                const distToUser = haversineDistance(
+                    ctx.userLocation.latitude, ctx.userLocation.longitude,
+                    stop.latitude, stop.longitude
+                );
+                if (distToUser < userWalkDistanceKm && distToUser <= 2) {
+                    userWalkDistanceKm = distToUser;
+                    bestCatchStop = stop;
+                    stopsAwayFromBus = stop.stop_order - busStopOrder;
+                }
+            }
+        }
+    }
+
+    // Calculate bus ETA to catch stop
+    let busEtaMinutes = 0;
+    if (bestCatchStop && nearestStop) {
+        let distanceToCatchStop = 0;
+        for (let i = 0; i < vehicleStops.length - 1; i++) {
+            if (vehicleStops[i].stop_order >= nearestStop.stop_order &&
+                vehicleStops[i].stop_order < bestCatchStop.stop_order) {
+                distanceToCatchStop += haversineDistance(
+                    vehicleStops[i].latitude, vehicleStops[i].longitude,
+                    vehicleStops[i + 1].latitude, vehicleStops[i + 1].longitude
+                );
+            }
+        }
+        busEtaMinutes = calculateETA(distanceToCatchStop, stopsAwayFromBus, latestLocation.speed || undefined);
+    }
+
+    // Get Mapbox walking directions to catch stop
+    if (ctx.userLocation && bestCatchStop) {
+        const accessToken = Deno.env.get('MAPBOX_ACCESS_TOKEN');
+        if (accessToken) {
+            try {
+                const coordinates = `${ctx.userLocation.longitude},${ctx.userLocation.latitude};${bestCatchStop.longitude},${bestCatchStop.latitude}`;
+                const mapboxUrl = `${MAPBOX_API_URL}/${coordinates}?access_token=${accessToken}&steps=true&overview=full&geometries=polyline&language=en`;
+                console.log(`[TrackerAgent] Getting walking directions to ${bestCatchStop.name}`);
+                const mapboxResponse = await fetch(mapboxUrl);
+                if (mapboxResponse.ok) {
+                    const mapboxData = await mapboxResponse.json();
+                    if (mapboxData.routes && mapboxData.routes.length > 0) {
+                        const route = mapboxData.routes[0];
+                        const legs = route.legs[0];
+                        const steps = (legs.steps || []).map((step: { maneuver?: { instruction?: string }; distance?: number }) => ({
+                            instruction: step.maneuver?.instruction || 'Continue',
+                            distance: Math.round(step.distance || 0)
+                        }));
+                        ctx.walkingDirections = {
+                            destinationStop: bestCatchStop.name,
+                            distanceMeters: Math.round(route.distance),
+                            durationMinutes: Math.ceil(route.duration / 60),
+                            steps,
+                            summary: `${Math.ceil(route.duration / 60)} min walk (${Math.round(route.distance)}m)`
+                        };
+                        console.log(`[TrackerAgent] Walking: ${ctx.walkingDirections.summary}`);
+                    }
+                }
+            } catch (e) { console.warn('[TrackerAgent] Walking directions failed:', e); }
+        }
+    }
+
+    // Store in filtered buses for response generation
+    ctx.filteredBuses = [{
+        vehicle,
+        latestLocation,
+        nearestStop,
+        stopsAwayFromUser: stopsAwayFromBus,
+        etaMinutes: busEtaMinutes,
+        isMoving,
+        ageSeconds,
+        tripStatus: latestLocation.trip_status || 'unknown',
+        headingDirection: headingDir || undefined,
+        freshness
+    }];
+
+    // Build enhanced message
+    let message = `📍 **${vehicle.name}** is ${isMoving ? 'moving' : 'stopped'}`;
+    if (headingDir) message += ` heading ${headingDir}`;
+    message += ` near ${nearestStop?.name || 'unknown'}`;
+
+    if (latestLocation.trip_status === 'started') {
+        message += ' 🟢 (trip active)';
+    } else if (latestLocation.trip_status === 'stopped') {
+        message += ' 🔴 (trip ended)';
+    }
+
+    if (bestCatchStop && ctx.walkingDirections) {
+        message += `\n\n🚶 Walk to **${bestCatchStop.name}** (${ctx.walkingDirections.summary})`;
+        message += `\n⏱️ Bus arrives in ~${busEtaMinutes} min (${stopsAwayFromBus} stops away)`;
+    }
+
+    return {
+        success: true,
+        agentName: 'TrackerAgent',
+        data: {
+            bus: vehicle.name,
+            vehicleNumber: vehicle.vehicle_number,
+            nearestStop: nearestStop?.name,
+            catchStop: bestCatchStop?.name,
+            isMoving,
+            speed: latestLocation.speed || 0,
+            heading: headingDir,
+            tripStatus: latestLocation.trip_status,
+            ageSeconds,
+            freshness: freshness.status,
+            busEtaMinutes,
+            stopsAway: stopsAwayFromBus,
+            walkingDirections: ctx.walkingDirections
+        },
+        message,
+        confidence: freshness.freshnessScore,
+        executionTimeMs: Date.now() - startTime
+    };
+}
+
+// ============================================================================
+// GEOCODING AGENT - Place Name Enrichment (Kept as requested)
+// ============================================================================
+
+const NOMINATIM_BASE_URL = 'https://nominatim.openstreetmap.org';
+const geocodeCache = new Map<string, { name: string; timestamp: number }>();
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+
+async function enrichWithPlaceNames(ctx: PipelineContext): Promise<AgentOutput> {
+    const startTime = Date.now();
+    ctx.geocodedPlaces = {};
+
+    // Skip if no user location
+    if (!ctx.userLocation) {
+        return {
+            success: true,
+            agentName: 'GeocodingAgent',
+            data: { enriched: 0 },
+            message: 'No location to enrich',
+            confidence: 1.0,
+            executionTimeMs: Date.now() - startTime
+        };
+    }
+
+    try {
+        const cacheKey = `${ctx.userLocation.latitude.toFixed(4)},${ctx.userLocation.longitude.toFixed(4)}`;
+        const cached = geocodeCache.get(cacheKey);
+        let usedCache = false;
+        let hasNeighbourhood = false;
+
+        if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
+            ctx.geocodedPlaces.userLocation = cached.name;
+            ctx.geocodedPlaces.userLocationFreshness = 'cached';
+            usedCache = true;
+            // Assume cached values were high quality if we cached them
+            hasNeighbourhood = true;
+        } else {
+            const response = await fetch(
+                `${NOMINATIM_BASE_URL}/reverse?lat=${ctx.userLocation.latitude}&lon=${ctx.userLocation.longitude}&format=json&addressdetails=1`,
+                { headers: { 'User-Agent': 'SaharaBusApp/1.0' } }
+            );
+
+            if (response.ok) {
+                const data = await response.json();
+                const address = data.address || {};
+
+                // Track if we got specific neighbourhood data
+                hasNeighbourhood = !!(address.neighbourhood || address.suburb);
+
+                const name = address.neighbourhood || address.suburb || address.village ||
+                    address.town || address.city || data.display_name?.split(',')[0] || 'Unknown';
+
+                ctx.geocodedPlaces.userLocation = name;
+                ctx.geocodedPlaces.userLocationFreshness = 'live';
+                geocodeCache.set(cacheKey, { name, timestamp: Date.now() });
+            }
+        }
+
+        // Dynamic confidence: higher if we got specific neighbourhood, lower for fallbacks
+        const dynamicConfidence = hasNeighbourhood ? 0.95 : 0.75;
+
+        return {
+            success: true,
+            agentName: 'GeocodingAgent',
+            data: {
+                userLocation: ctx.geocodedPlaces.userLocation,
+                freshness: usedCache ? 'cached' : 'live',
+                isSpecific: hasNeighbourhood
+            },
+            message: ctx.geocodedPlaces.userLocation ? `User near ${ctx.geocodedPlaces.userLocation}` : 'Could not geocode',
+            confidence: dynamicConfidence,
+            executionTimeMs: Date.now() - startTime
+        };
+    } catch (error) {
+        return {
+            success: false,
+            agentName: 'GeocodingAgent',
+            data: {},
+            error: error instanceof Error ? error.message : 'Geocoding failed',
+            confidence: 0,
+            executionTimeMs: Date.now() - startTime
+        };
+    }
+}
+
+// ============================================================================
+// WALKING DIRECTIONS AGENT - Mapbox API Integration
+// ============================================================================
+
+const MAPBOX_API_URL = 'https://api.mapbox.com/directions/v5/mapbox/walking';
+
+/**
+ * Get walking directions from Mapbox API to the nearest bus stop
+ */
+async function getWalkingDirectionsFromMapbox(ctx: PipelineContext): Promise<AgentOutput> {
+    const startTime = Date.now();
+
+    try {
+        const accessToken = Deno.env.get('MAPBOX_ACCESS_TOKEN');
+
+        if (!accessToken) {
+            console.warn('[WalkingDirectionsAgent] MAPBOX_ACCESS_TOKEN not configured');
+            return {
+                success: false,
+                agentName: 'WalkingDirectionsAgent',
+                data: {},
+                error: 'Mapbox access token not configured',
+                confidence: 0,
+                executionTimeMs: Date.now() - startTime
+            };
+        }
+
+        if (!ctx.userLocation || !ctx.nearestStops || ctx.nearestStops.length === 0) {
+            return {
+                success: false,
+                agentName: 'WalkingDirectionsAgent',
+                data: {},
+                error: 'No user location or nearby stops available',
+                confidence: 0,
+                executionTimeMs: Date.now() - startTime
+            };
+        }
+
+        // Get the nearest stop
+        const nearestStop = ctx.nearestStops[0];
+        const destLat = nearestStop.stop.latitude;
+        const destLng = nearestStop.stop.longitude;
+        const originLat = ctx.userLocation.latitude;
+        const originLng = ctx.userLocation.longitude;
+
+        // Mapbox uses longitude,latitude format
+        const coordinates = `${originLng},${originLat};${destLng},${destLat}`;
+        const url = `${MAPBOX_API_URL}/${coordinates}?` + new URLSearchParams({
+            access_token: accessToken,
+            steps: 'true',
+            overview: 'full',
+            geometries: 'polyline',
+            language: 'en'
+        });
+
+        console.log(`[WalkingDirectionsAgent] Calling Mapbox: ${originLat},${originLng} → ${destLat},${destLng}`);
+
+        const response = await fetch(url);
+
+        if (!response.ok) {
+            const errorText = await response.text();
+            console.error('[WalkingDirectionsAgent] Mapbox API error:', response.status, errorText);
+            return {
+                success: false,
+                agentName: 'WalkingDirectionsAgent',
+                data: {},
+                error: `Mapbox API error: ${response.status}`,
+                confidence: 0,
+                executionTimeMs: Date.now() - startTime
+            };
+        }
+
+        const data = await response.json();
+
+        if (!data.routes || data.routes.length === 0) {
+            return {
+                success: false,
+                agentName: 'WalkingDirectionsAgent',
+                data: {},
+                error: 'No walking route found',
+                confidence: 0,
+                executionTimeMs: Date.now() - startTime
+            };
+        }
+
+        const route = data.routes[0];
+        const legs = route.legs[0];
+
+        // Extract steps (limit to 6 for LLM safety - long lists don't help conversational responses)
+        const allSteps = (legs.steps || []).map((step: {
+            maneuver?: { instruction?: string };
+            distance?: number;
+        }) => ({
+            instruction: step.maneuver?.instruction || 'Continue',
+            distance: Math.round(step.distance || 0)
+        }));
+        const steps: Array<{ instruction: string; distance: number }> = allSteps.slice(0, 6);
+
+        const durationSeconds = Math.round(route.duration);
+        const durationMinutes = Math.ceil(durationSeconds / 60);
+        const distanceMeters = Math.round(route.distance);
+
+        // Store in context
+        ctx.walkingDirections = {
+            destinationStop: nearestStop.stop.name,
+            distanceMeters,
+            durationMinutes,
+            steps,
+            summary: `${durationMinutes} min walk (${distanceMeters}m)`
+        };
+
+        console.log(`[WalkingDirectionsAgent] Got directions: ${ctx.walkingDirections.summary}`);
+
+        // Publish to hub for multi-agent communication
+        ctx.hub.publish({
+            type: MessageType.WALKING_DIRECTIONS_READY,
+            source: 'WalkingDirectionsAgent',
+            payload: {
+                destinationStop: nearestStop.stop.name,
+                distanceMeters,
+                durationMinutes,
+                stepsCount: steps.length,
+                summary: ctx.walkingDirections.summary
+            },
+            priority: MessagePriority.NORMAL
+        });
+
+        return {
+            success: true,
+            agentName: 'WalkingDirectionsAgent',
+            data: {
+                destinationStop: nearestStop.stop.name,
+                distanceMeters,
+                durationMinutes,
+                stepsCount: steps.length
+            },
+            message: `Walking directions to ${nearestStop.stop.name}: ${durationMinutes} min (${distanceMeters}m)`,
+            confidence: 0.95,
+            executionTimeMs: Date.now() - startTime
+        };
+
+    } catch (error) {
+        console.error('[WalkingDirectionsAgent] Error:', error);
+        return {
+            success: false,
+            agentName: 'WalkingDirectionsAgent',
+            data: {},
+            error: error instanceof Error ? error.message : 'Walking directions failed',
+            confidence: 0,
+            executionTimeMs: Date.now() - startTime
+        };
+    }
+}
+
+// ============================================================================
+// BUS PREDICTION AGENT - Arrival Time Predictions
+// ============================================================================
+
+interface ArrivalPrediction {
+    vehicleId: string;
+    vehicleName: string;
+    stopName: string;
+    predictedArrivalMinutes: number;
+    confidence: number;
+    basedOn: 'live_location' | 'historical' | 'schedule';
+    isApproaching: boolean;
+}
+
+async function predictBusArrivals(ctx: PipelineContext): Promise<AgentOutput> {
+    const startTime = Date.now();
+
+    if (!ctx.nearestStops || ctx.nearestStops.length === 0 || !ctx.latestLocations) {
+        return {
+            success: false,
+            agentName: 'BusPredictionAgent',
+            data: {},
+            error: 'No stops or locations available for prediction',
+            confidence: 0,
+            executionTimeMs: Date.now() - startTime
+        };
+    }
+
+    const predictions: ArrivalPrediction[] = [];
+    const latestMap = getLatestBusLocations(ctx.latestLocations);
+
+    for (const nearStop of ctx.nearestStops.slice(0, 3)) {
+        const latestLoc = latestMap.get(nearStop.vehicleId);
+
+        if (latestLoc) {
+            // Calculate distance from bus to this stop
+            const distToStop = haversineDistance(
+                latestLoc.latitude, latestLoc.longitude,
+                nearStop.stop.latitude, nearStop.stop.longitude
+            );
+
+            // Use actual speed if available, fallback to default
+            const speed = (latestLoc.speed && latestLoc.speed > 2)
+                ? latestLoc.speed
+                : DEFAULT_BUS_SPEED_KMH;
+
+            // Base prediction on distance and speed
+            let predictedMinutes = Math.ceil((distToStop / speed) * 60);
+
+            // Add buffer for stops in between
+            const stopsAway = getStopsAway(nearStop.vehicleId, latestLoc, nearStop.stop, ctx.allStops || []);
+            predictedMinutes += Math.max(0, stopsAway) * 0.5; // 30 sec per stop
+
+            // Calculate confidence based on data freshness
+            const freshness = calculateLocationFreshness(latestLoc);
+            const isApproaching = stopsAway >= 0 && stopsAway <= 3 && (latestLoc.speed || 0) > 2;
+
+            predictions.push({
+                vehicleId: nearStop.vehicleId,
+                vehicleName: nearStop.vehicleName,
+                stopName: nearStop.stop.name,
+                predictedArrivalMinutes: Math.round(predictedMinutes),
+                confidence: freshness.freshnessScore * 0.9,
+                basedOn: freshness.status === 'live' ? 'live_location' : 'historical',
+                isApproaching
+            });
+        }
+    }
+
+    // Sort by predicted arrival time
+    predictions.sort((a, b) => a.predictedArrivalMinutes - b.predictedArrivalMinutes);
+
+    // Store predictions in context for response generation
+    (ctx as unknown as { arrivalPredictions: ArrivalPrediction[] }).arrivalPredictions = predictions;
+
+    return {
+        success: predictions.length > 0,
+        agentName: 'BusPredictionAgent',
+        data: { predictions, count: predictions.length },
+        message: predictions.length > 0
+            ? `Next bus: ${predictions[0].vehicleName} in ~${predictions[0].predictedArrivalMinutes} min${predictions[0].isApproaching ? ' (approaching!)' : ''}`
+            : 'No predictions available',
+        confidence: predictions.length > 0 ? predictions[0].confidence : 0,
+        executionTimeMs: Date.now() - startTime
+    };
+}
+
+/**
+ * Calculate bearing between two points in degrees (0-360)
+ * Formula: θ = atan2(sin(Δλ)⋅cos(φ₂), cos(φ₁)⋅sin(φ₂) − sin(φ₁)⋅cos(φ₂)⋅cos(Δλ))
+ */
+function calculateBearing(lat1: number, lng1: number, lat2: number, lng2: number): number {
+    const φ1 = lat1 * Math.PI / 180;
+    const φ2 = lat2 * Math.PI / 180;
+    const Δλ = (lng2 - lng1) * Math.PI / 180;
+
+    const y = Math.sin(Δλ) * Math.cos(φ2);
+    const x = Math.cos(φ1) * Math.sin(φ2) - Math.sin(φ1) * Math.cos(φ2) * Math.cos(Δλ);
+    const θ = Math.atan2(y, x);
+
+    return (θ * 180 / Math.PI + 360) % 360;
+}
+
+/**
+ * Calculate shortest distance from point to line segment
+ * Uses perpendicular projection formula with segment bounds checking
+ */
+function pointToSegmentDistance(
+    pointLat: number,
+    pointLng: number,
+    seg1Lat: number,
+    seg1Lng: number,
+    seg2Lat: number,
+    seg2Lng: number
+): { distance: number; projection: number } {
+    // Convert to approximate cartesian for segment projection (works for small distances)
+    const px = pointLng;
+    const py = pointLat;
+    const x1 = seg1Lng;
+    const y1 = seg1Lat;
+    const x2 = seg2Lng;
+    const y2 = seg2Lat;
+
+    const dx = x2 - x1;
+    const dy = y2 - y1;
+    const segLengthSq = dx * dx + dy * dy;
+
+    if (segLengthSq === 0) {
+        // Degenerate segment - just return distance to point
+        return {
+            distance: haversineDistance(pointLat, pointLng, seg1Lat, seg1Lng),
+            projection: 0
+        };
+    }
+
+    // Calculate projection parameter t (0 = at seg1, 1 = at seg2)
+    const t = Math.max(0, Math.min(1, ((px - x1) * dx + (py - y1) * dy) / segLengthSq));
+
+    // Find closest point on segment
+    const closestLat = y1 + t * dy;
+    const closestLng = x1 + t * dx;
+
+    return {
+        distance: haversineDistance(pointLat, pointLng, closestLat, closestLng),
+        projection: t // 0-1, how far along the segment
+    };
+}
+
+/**
+ * Get stops away using route segment projection and bearing analysis
+ * This fixes the issue of approximate nearest-stop calculation
+ */
+function getStopsAway(
+    vehicleId: string,
+    currentLoc: LiveLocation,
+    targetStop: RouteStop,
+    allStops: RouteStop[]
+): number {
+    const vehicleStops = allStops
+        .filter(s => s.vehicle_id === vehicleId)
+        .sort((a, b) => a.stop_order - b.stop_order);
+
+    if (vehicleStops.length === 0) return -1;
+
+    // ========================================
+    // IMPROVED ALGORITHM: Route Segment Projection
+    // ========================================
+    // Instead of finding nearest stop by distance,
+    // we project the bus onto the route path
+    // ========================================
+
+    let bestSegmentIndex = -1;
+    let bestProjection = 0;
+    let minSegmentDist = Infinity;
+
+    // Find which route segment the bus is on
+    for (let i = 0; i < vehicleStops.length - 1; i++) {
+        const stop1 = vehicleStops[i];
+        const stop2 = vehicleStops[i + 1];
+
+        const { distance, projection } = pointToSegmentDistance(
+            currentLoc.latitude,
+            currentLoc.longitude,
+            stop1.latitude,
+            stop1.longitude,
+            stop2.latitude,
+            stop2.longitude
+        );
+
+        if (distance < minSegmentDist) {
+            minSegmentDist = distance;
+            bestSegmentIndex = i;
+            bestProjection = projection;
+        }
+    }
+
+    // If no segment found, fall back to nearest stop
+    if (bestSegmentIndex === -1) {
+        let nearestStopIndex = 0;
+        let minDist = Infinity;
+
+        for (let i = 0; i < vehicleStops.length; i++) {
+            const dist = haversineDistance(
+                currentLoc.latitude,
+                currentLoc.longitude,
+                vehicleStops[i].latitude,
+                vehicleStops[i].longitude
+            );
+            if (dist < minDist) {
+                minDist = dist;
+                nearestStopIndex = i;
+            }
+        }
+
+        return targetStop.stop_order - vehicleStops[nearestStopIndex].stop_order;
+    }
+
+    // Calculate interpolated stop order based on segment position
+    const currentSegmentStop = vehicleStops[bestSegmentIndex];
+    const nextSegmentStop = vehicleStops[bestSegmentIndex + 1];
+
+    // Use bearing to determine direction (is bus moving toward next stop?)
+    let isMovingForward = true;
+
+    if (currentLoc.heading !== null && currentLoc.heading !== undefined) {
+        // Calculate expected bearing from current position to next stop
+        const bearingToNext = calculateBearing(
+            currentLoc.latitude,
+            currentLoc.longitude,
+            nextSegmentStop.latitude,
+            nextSegmentStop.longitude
+        );
+
+        // Calculate bearing difference
+        let bearingDiff = Math.abs(currentLoc.heading - bearingToNext);
+        if (bearingDiff > 180) bearingDiff = 360 - bearingDiff;
+
+        // If bus heading differs by more than 90°, it might be going backward
+        isMovingForward = bearingDiff < 90;
+    }
+
+    // Interpolate current stop order position
+    const interpolatedOrder = isMovingForward
+        ? currentSegmentStop.stop_order + bestProjection
+        : currentSegmentStop.stop_order - (1 - bestProjection);
+
+    // Calculate stops away (fractional is ok, will be rounded later)
+    const stopsAway = targetStop.stop_order - interpolatedOrder;
+
+    return Math.round(stopsAway);
+}
+
+// ============================================================================
+// ENDPOINT DELEGATION (Phase 2 - Multi-Agent via HTTP)
+// ============================================================================
+
+interface DelegatedResponse {
+    success: boolean;
+    response: string;
+    intent: string;
+    routeData?: Record<string, unknown>;
+    executionTimeMs: number;
+}
+
+/**
+ * Call an Edge Function via HTTP.
+ * This enables true multi-agent architecture where each function is a separate service.
+ */
+async function callEdgeFunction(
+    functionName: string,
+    payload: Record<string, unknown>
+): Promise<Record<string, unknown>> {
+    const supabaseUrl = Deno.env.get('SUPABASE_URL');
+    const serviceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY');
+
+    if (!supabaseUrl || !serviceKey) {
+        throw new Error('Missing Supabase configuration');
+    }
+
+    const url = `${supabaseUrl}/functions/v1/${functionName}`;
+    console.log(`[AgentOrchestrator] Calling ${functionName} agent...`);
+
+    const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${serviceKey}`
+        },
+        body: JSON.stringify(payload)
+    });
+
+    if (!response.ok) {
+        const errorText = await response.text();
+        console.error(`[AgentOrchestrator] ${functionName} failed:`, response.status, errorText);
+        throw new Error(`${functionName} agent failed: ${response.status}`);
+    }
+
+    return await response.json();
+}
+
+/**
+ * Delegate query to specialized Edge Function agents.
+ * Each agent is a separate Edge Function called via HTTP.
+ */
+async function delegateToEndpoint(
+    decision: RouteDecision,
+    userLocation?: { latitude: number; longitude: number },
+    userId?: string
+): Promise<DelegatedResponse> {
+    const startTime = Date.now();
+    const params = decision.extractedParams;
+
+    switch (decision.endpoint) {
+        case EndpointType.TRACK_BUS: {
+            // Call track-bus Edge Function agent
+            try {
+                const result = await callEdgeFunction('track-bus', {
+                    busName: params.busName || params.busNumber || ''
+                });
+
+                return {
+                    success: result.success === true,
+                    response: (result.message as string) || (result.error as string) || 'Could not track bus',
+                    intent: 'TRACK_BUS',
+                    routeData: result.success ? {
+                        busId: result.busId,
+                        busName: result.busName,
+                        position: result.position,
+                        speed: result.speed,
+                        nearestStop: result.nearestStop,
+                        freshness: result.freshness
+                    } : undefined,
+                    executionTimeMs: Date.now() - startTime
+                };
+            } catch (error) {
+                // Fallback to internal if Edge Function fails
+                console.warn('[AgentOrchestrator] track-bus agent failed, using internal:', error);
+                const result = await trackBusInternal(params.busName || params.busNumber || '');
+                return {
+                    success: result.success,
+                    response: result.message || result.error || 'Could not track bus',
+                    intent: 'TRACK_BUS',
+                    routeData: result.success ? {
+                        busId: result.busId,
+                        busName: result.busName,
+                        position: result.position,
+                        speed: result.speed,
+                        nearestStop: result.nearestStop
+                    } : undefined,
+                    executionTimeMs: Date.now() - startTime
+                };
+            }
+        }
+
+        case EndpointType.FIND_ROUTE: {
+            // Call find-route Edge Function agent
+            try {
+                const result = await callEdgeFunction('find-route', {
+                    origin: params.origin,
+                    destination: params.destination || '',
+                    userLocation
+                });
+
+                // Also get walking directions if we have a route and user location
+                let walkingInfo = '';
+                if (result.success && result.bestRoute && userLocation) {
+                    try {
+                        const walkResult = await callEdgeFunction('get-walking-directions', {
+                            originLat: userLocation.latitude,
+                            originLng: userLocation.longitude,
+                            destLat: (result.bestRoute as Record<string, unknown>).originStopLat,
+                            destLng: (result.bestRoute as Record<string, unknown>).originStopLng,
+                            destStopName: (result.bestRoute as Record<string, unknown>).originStop
+                        });
+                        if (walkResult.success && walkResult.walkingRoute) {
+                            const wr = walkResult.walkingRoute as Record<string, unknown>;
+                            walkingInfo = `\n\n🚶 Walk to pickup: ${wr.summary}`;
+                        }
+                    } catch {
+                        // Walking directions optional, continue without
+                    }
+                }
+
+                return {
+                    success: result.success === true,
+                    response: ((result.message as string) || 'Route found') + walkingInfo,
+                    intent: 'FIND_ROUTE',
+                    routeData: result.bestRoute as Record<string, unknown>,
+                    executionTimeMs: Date.now() - startTime
+                };
+            } catch (error) {
+                // Fallback to internal if Edge Function fails
+                console.warn('[AgentOrchestrator] find-route agent failed, using internal:', error);
+                const result = await findRouteInternal(
+                    params.origin,
+                    params.destination || '',
+                    userLocation
+                );
+                return {
+                    success: result.success,
+                    response: result.message,
+                    intent: 'FIND_ROUTE',
+                    routeData: result.bestRoute as Record<string, unknown>,
+                    executionTimeMs: Date.now() - startTime
+                };
+            }
+        }
+
+        case EndpointType.NEARBY_STOPS: {
+            // Call get-nearby-stops Edge Function agent
+            if (!userLocation) {
+                return {
+                    success: false,
+                    response: 'Please share your location to find nearby stops.',
+                    intent: 'FIND_NEARBY',
+                    executionTimeMs: Date.now() - startTime
+                };
+            }
+
+            try {
+                const result = await callEdgeFunction('get-nearby-stops', {
+                    latitude: userLocation.latitude,
+                    longitude: userLocation.longitude,
+                    radiusKm: params.radiusKm || 1.0
+                });
+
+                // Also get walking directions to nearest stop
+                let walkingInfo = '';
+                if (result.success && result.stops && (result.stops as unknown[]).length > 0) {
+                    try {
+                        const walkResult = await callEdgeFunction('get-walking-directions', {
+                            originLat: userLocation.latitude,
+                            originLng: userLocation.longitude,
+                            findNearestStop: true
+                        });
+                        if (walkResult.success && walkResult.walkingRoute) {
+                            const wr = walkResult.walkingRoute as Record<string, unknown>;
+                            walkingInfo = `\n\n🚶 Walk to nearest: ${wr.summary}`;
+                        }
+                    } catch {
+                        // Walking directions optional
+                    }
+                }
+
+                return {
+                    success: result.success === true,
+                    response: ((result.message as string) || 'Found nearby stops') + walkingInfo,
+                    intent: 'FIND_NEARBY',
+                    routeData: { stops: result.stops, count: result.count },
+                    executionTimeMs: Date.now() - startTime
+                };
+            } catch (error) {
+                // Fallback to internal
+                console.warn('[AgentOrchestrator] get-nearby-stops agent failed, using internal:', error);
+                const result = await findNearbyStopsInternal(
+                    userLocation.latitude,
+                    userLocation.longitude,
+                    params.radiusKm || 1.0
+                );
+                return {
+                    success: result.success,
+                    response: result.message || 'Found nearby stops',
+                    intent: 'FIND_NEARBY',
+                    routeData: { stops: result.stops, count: result.count },
+                    executionTimeMs: Date.now() - startTime
+                };
+            }
+        }
+
+        default:
+            throw new Error(`Unsupported endpoint: ${decision.endpoint}`);
+    }
+}
+
+/**
+ * Internal track-bus implementation (reuses existing logic)
+ */
+async function trackBusInternal(busRef: string): Promise<{
+    success: boolean;
+    busId?: string;
+    busName?: string;
+    position?: { latitude: number; longitude: number };
+    speed?: number;
+    nearestStop?: string;
+    message?: string;
+    error?: string;
+}> {
+    try {
+        const client = getSupabase();
+
+        // Fetch vehicles
+        const { data: vehicles } = await client.from('vehicles').select('*');
+
+        // ========================================
+        // OPTIMIZED: Use RPC function for latest locations
+        // Performance: DISTINCT ON with index vs N-scan + memory filter
+        // ========================================
+        const { data: locations, error: locError } = await client
+            .rpc('get_latest_bus_locations', { freshness_seconds: 60 });
+        
+        if (locError) {
+            console.warn('[trackBusInternal] RPC fallback to manual query:', locError);
+            // Fallback to manual query if RPC not available
+            const { data: rawLocations } = await client
+                .from('locations')
+                .select('*')
+                .order('timestamp', { ascending: false })
+                .limit(1000); // Limit for performance
+            
+            const latestLocations = new Map<string, LiveLocation>();
+            for (const loc of (rawLocations || []) as LiveLocation[]) {
+                if (!latestLocations.has(loc.bus_id)) {
+                    latestLocations.set(loc.bus_id, loc);
+                }
+            }
+        } else {
+            // Convert RPC result to Map
+            const latestLocations = new Map<string, LiveLocation>();
+            for (const loc of (locations || []) as LiveLocation[]) {
+                latestLocations.set(loc.bus_id, loc);
+            }
+        }
+
+        // Find target bus
+        let targetLocation: LiveLocation | undefined;
+        let targetVehicle: Vehicle | undefined;
+
+        const busRefLower = busRef.toLowerCase();
+        for (const [busId, loc] of latestLocations) {
+            const vehicle = (vehicles as Vehicle[])?.find(v => v.id === busId);
+            if (vehicle?.name.toLowerCase().includes(busRefLower) ||
+                vehicle?.vehicle_number.toLowerCase().includes(busRefLower) ||
+                busId.includes(busRefLower)) {
+                targetLocation = loc;
+                targetVehicle = vehicle;
+                break;
+            }
+        }
+
+        if (!targetLocation) {
+            return {
+                success: false,
+                error: `Could not find bus "${busRef}". It may not be sharing its location right now.`
+            };
+        }
+
+        // Fetch stops for nearest stop calculation
+        const { data: stops } = await client
+            .from('route_stops')
+            .select('*')
+            .eq('vehicle_id', targetLocation.bus_id);
+
+        let nearestStop = '';
+        let nearestDistance = Infinity;
+        for (const stop of (stops || []) as RouteStop[]) {
+            const dist = haversineDistance(
+                targetLocation.latitude,
+                targetLocation.longitude,
+                stop.latitude,
+                stop.longitude
+            );
+            if (dist < nearestDistance) {
+                nearestDistance = dist;
+                nearestStop = stop.name;
+            }
+        }
+
+        const movingStatus = (targetLocation.speed || 0) > 2 ? 'moving' : 'stopped';
+        const speedInfo = (targetLocation.speed || 0) > 0 ? ` at ${Math.round(targetLocation.speed || 0)} km/h` : '';
+
+        return {
+            success: true,
+            busId: targetLocation.bus_id,
+            busName: targetVehicle?.name || targetLocation.bus_id,
+            position: { latitude: targetLocation.latitude, longitude: targetLocation.longitude },
+            speed: targetLocation.speed || 0,
+            nearestStop,
+            message: `📍 **${targetVehicle?.name || busRef}** is currently ${movingStatus}${speedInfo} near ${nearestStop}.`
+        };
+    } catch (error) {
+        return {
+            success: false,
+            error: error instanceof Error ? error.message : 'Failed to track bus'
+        };
+    }
+}
+
+/**
+ * Internal find-route implementation
+ */
+async function findRouteInternal(
+    origin: string | undefined,
+    destination: string,
+    userLocation?: { latitude: number; longitude: number }
+): Promise<{
+    success: boolean;
+    message: string;
+    bestRoute?: Record<string, unknown>;
+    alternatives?: Record<string, unknown>[];
+}> {
+    try {
+        const client = getSupabase();
+
+        // Fetch all stops
+        const { data: allStops } = await client
+            .from('route_stops')
+            .select('*')
+            .order('vehicle_id')
+            .order('stop_order');
+
+        if (!allStops || allStops.length === 0) {
+            return { success: false, message: 'No bus stops found in the system.' };
+        }
+
+        const destLower = destination.toLowerCase();
+        const originLower = origin?.toLowerCase() || '';
+
+        const destStops = (allStops as RouteStop[]).filter(s => s.name.toLowerCase().includes(destLower));
+
+        if (destStops.length === 0) {
+            return { success: false, message: `Sorry, I couldn't find any stops matching "${destination}".` };
+        }
+
+        // Group stops by vehicle
+        const vehicleStopsMap = new Map<string, RouteStop[]>();
+        for (const stop of allStops as RouteStop[]) {
+            const existing = vehicleStopsMap.get(stop.vehicle_id) || [];
+            existing.push(stop);
+            vehicleStopsMap.set(stop.vehicle_id, existing);
+        }
+
+        // Find matching routes
+        const matches: Array<{ vehicleId: string; originStop: RouteStop; destStop: RouteStop; stopsInPath: RouteStop[]; distance: number }> = [];
+
+        for (const destStop of destStops) {
+            const vehicleStops = vehicleStopsMap.get(destStop.vehicle_id) || [];
+            // Sort by stop_order
+            vehicleStops.sort((a, b) => a.stop_order - b.stop_order);
+
+            if (origin) {
+                // User provided an origin name - match by name
+                const validOrigins = vehicleStops.filter(s =>
+                    s.name.toLowerCase().includes(originLower) && s.stop_order < destStop.stop_order
+                );
+                for (const originStop of validOrigins) {
+                    const stopsInPath = vehicleStops
+                        .filter(s => s.stop_order >= originStop.stop_order && s.stop_order <= destStop.stop_order);
+
+                    // Calculate distance for sorting
+                    let dist = 0;
+                    for (let i = 0; i < stopsInPath.length - 1; i++) {
+                        dist += haversineDistance(
+                            stopsInPath[i].latitude, stopsInPath[i].longitude,
+                            stopsInPath[i + 1].latitude, stopsInPath[i + 1].longitude
+                        );
+                    }
+                    matches.push({ vehicleId: destStop.vehicle_id, originStop, destStop, stopsInPath, distance: dist });
+                }
+            } else if (userLocation) {
+                // Find closest stop to user on this route (before destination)
+                let closestStop: RouteStop | null = null;
+                let closestDist = Infinity;
+                for (const stop of vehicleStops) {
+                    if (stop.stop_order < destStop.stop_order) {
+                        const dist = haversineDistance(userLocation.latitude, userLocation.longitude, stop.latitude, stop.longitude);
+                        if (dist < closestDist) { closestDist = dist; closestStop = stop; }
+                    }
+                }
+                // Increased radius to 5km for better coverage
+                if (closestStop && closestDist < 5) {
+                    const stopsInPath = vehicleStops
+                        .filter(s => s.stop_order >= closestStop!.stop_order && s.stop_order <= destStop.stop_order);
+
+                    let dist = 0;
+                    for (let i = 0; i < stopsInPath.length - 1; i++) {
+                        dist += haversineDistance(
+                            stopsInPath[i].latitude, stopsInPath[i].longitude,
+                            stopsInPath[i + 1].latitude, stopsInPath[i + 1].longitude
+                        );
+                    }
+                    matches.push({ vehicleId: destStop.vehicle_id, originStop: closestStop, destStop, stopsInPath, distance: dist });
+                }
+            } else {
+                // No origin or userLocation - use first stop before destination as origin
+                const stopsBeforeDest = vehicleStops.filter(s => s.stop_order < destStop.stop_order);
+                if (stopsBeforeDest.length > 0) {
+                    const originStop = stopsBeforeDest[0]; // First stop on route
+                    const stopsInPath = vehicleStops
+                        .filter(s => s.stop_order >= originStop.stop_order && s.stop_order <= destStop.stop_order);
+
+                    let dist = 0;
+                    for (let i = 0; i < stopsInPath.length - 1; i++) {
+                        dist += haversineDistance(
+                            stopsInPath[i].latitude, stopsInPath[i].longitude,
+                            stopsInPath[i + 1].latitude, stopsInPath[i + 1].longitude
+                        );
+                    }
+                    matches.push({ vehicleId: destStop.vehicle_id, originStop, destStop, stopsInPath, distance: dist });
+                }
+            }
+        }
+
+        if (matches.length === 0) {
+            return { success: false, message: `Sorry, I couldn't find a direct route to "${destination}".` };
+        }
+
+        // Sort matches by distance (shortest first)
+        matches.sort((a, b) => a.distance - b.distance);
+
+        // Fetch vehicle details
+        const vehicleIds = [...new Set(matches.map(m => m.vehicleId))];
+        const { data: vehicles } = await client.from('vehicles').select('*').in('id', vehicleIds);
+        const vehicleMap = new Map((vehicles as Vehicle[] || []).map((v: Vehicle) => [v.id, v]));
+
+        // Calculate ETA for best match
+        const best = matches[0];
+        const vehicle = vehicleMap.get(best.vehicleId) as Vehicle | undefined;
+        const eta = calculateETA(best.distance, best.stopsInPath.length - 1);
+
+        // ==========================================
+        // MAPBOX INTEGRATION: Get walking directions to pickup stop
+        // ==========================================
+        let walkingDirections: {
+            distanceMeters: number;
+            durationMinutes: number;
+            steps: Array<{ instruction: string; distance: number }>;
+            summary: string;
+        } | undefined;
+
+        if (userLocation) {
+            const accessToken = Deno.env.get('MAPBOX_ACCESS_TOKEN');
+            if (accessToken) {
+                try {
+                    const originStop = best.originStop;
+                    // Mapbox uses lng,lat format
+                    const coordinates = `${userLocation.longitude},${userLocation.latitude};${originStop.longitude},${originStop.latitude}`;
+                    const mapboxUrl = `${MAPBOX_API_URL}/${coordinates}?` + new URLSearchParams({
+                        access_token: accessToken,
+                        steps: 'true',
+                        overview: 'full',
+                        geometries: 'polyline',
+                        language: 'en'
+                    });
+
+                    console.log(`[MapboxAgent] Getting walking directions to ${originStop.name}`);
+                    const mapboxResponse = await fetch(mapboxUrl);
+
+                    if (mapboxResponse.ok) {
+                        const mapboxData = await mapboxResponse.json();
+                        if (mapboxData.routes && mapboxData.routes.length > 0) {
+                            const route = mapboxData.routes[0];
+                            const legs = route.legs[0];
+
+                            const steps: Array<{ instruction: string; distance: number }> = (legs.steps || []).map((step: {
+                                maneuver?: { instruction?: string };
+                                distance?: number;
+                            }) => ({
+                                instruction: step.maneuver?.instruction || 'Continue',
+                                distance: Math.round(step.distance || 0)
+                            }));
+
+                            walkingDirections = {
+                                distanceMeters: Math.round(route.distance),
+                                durationMinutes: Math.ceil(route.duration / 60),
+                                steps,
+                                summary: `${Math.ceil(route.duration / 60)} min walk (${Math.round(route.distance)}m)`
+                            };
+                            console.log(`[MapboxAgent] Walking: ${walkingDirections.summary}`);
+                        }
+                    }
+                } catch (mapboxError) {
+                    console.warn('[MapboxAgent] Walking directions failed:', mapboxError);
+                    // Continue without walking directions - graceful degradation
+                }
+            }
+        }
+
+        // Build message with walking directions if available
+        let message = `🚌 Take **${vehicle?.name || best.vehicleId}** from ${best.originStop.name} to ${best.destStop.name}.\n` +
+            `📏 ${Math.round(best.distance * 10) / 10} km • ${best.stopsInPath.length - 1} stops\n` +
+            `⏱️ ETA: **${eta} min**`;
+
+        if (walkingDirections) {
+            message += `\n\n🚶 **Walk to ${best.originStop.name}** (${walkingDirections.summary}):`;
+            walkingDirections.steps.slice(0, 3).forEach((step, i) => {
+                message += `\n  ${i + 1}. ${step.instruction} (${step.distance}m)`;
+            });
+            if (walkingDirections.steps.length > 3) {
+                message += `\n  ... and ${walkingDirections.steps.length - 3} more steps`;
+            }
+        }
+
+        // Build alternatives (next 2 routes)
+        const alternatives: Record<string, unknown>[] = [];
+        for (let i = 1; i < Math.min(3, matches.length); i++) {
+            const alt = matches[i];
+            const altVehicle = vehicleMap.get(alt.vehicleId) as Vehicle | undefined;
+            const altEta = calculateETA(alt.distance, alt.stopsInPath.length - 1);
+            alternatives.push({
+                vehicleId: alt.vehicleId,
+                vehicleName: altVehicle?.name,
+                originStop: alt.originStop.name,
+                destinationStop: alt.destStop.name,
+                distanceKm: Math.round(alt.distance * 10) / 10,
+                etaMinutes: altEta,
+                stopsInPath: alt.stopsInPath.map(s => s.name)
+            });
+        }
+
+        return {
+            success: true,
+            message,
+            bestRoute: {
+                vehicleId: best.vehicleId,
+                vehicleName: vehicle?.name,
+                originStop: best.originStop.name,
+                destinationStop: best.destStop.name,
+                distanceKm: Math.round(best.distance * 10) / 10,
+                etaMinutes: eta,
+                stopsInPath: best.stopsInPath.map(s => s.name),
+                walkingDirections // Include walking directions in route data
+            },
+            alternatives: alternatives.length > 0 ? alternatives : undefined
+        };
+    } catch (error) {
+        return { success: false, message: error instanceof Error ? error.message : 'Route search failed' };
+    }
+}
+
+/**
+ * Internal nearby-stops implementation
+ */
+async function findNearbyStopsInternal(
+    latitude: number,
+    longitude: number,
+    radiusKm: number
+): Promise<{
+    success: boolean;
+    stops: Array<{ name: string; distanceKm: number; vehicleName: string }>;
+    count: number;
+    message?: string;
+}> {
+    try {
+        const client = getSupabase();
+
+        const [vehiclesResult, stopsResult] = await Promise.all([
+            client.from('vehicles').select('*'),
+            client.from('route_stops').select('*')
+        ]);
+
+        const vehicles = (vehiclesResult.data || []) as Vehicle[];
+        const stops = (stopsResult.data || []) as RouteStop[];
+        const vehicleMap = new Map(vehicles.map(v => [v.id, v]));
+
+        const nearbyStops: Array<{ name: string; distanceKm: number; vehicleName: string }> = [];
+
+        for (const stop of stops) {
+            const dist = haversineDistance(latitude, longitude, stop.latitude, stop.longitude);
+            if (dist <= radiusKm) {
+                const vehicle = vehicleMap.get(stop.vehicle_id);
+                nearbyStops.push({
+                    name: stop.name,
+                    distanceKm: Math.round(dist * 1000) / 1000,
+                    vehicleName: vehicle?.name || stop.vehicle_id
+                });
+            }
+        }
+
+        nearbyStops.sort((a, b) => a.distanceKm - b.distanceKm);
+
+        let message = '';
+        if (nearbyStops.length === 0) {
+            message = `📍 No bus stops found within ${radiusKm} km.`;
+        } else {
+            const top3 = nearbyStops.slice(0, 3);
+            message = `📍 Found ${nearbyStops.length} stops within ${radiusKm} km:\n` +
+                top3.map((s, i) => `${i + 1}. **${s.name}** (${s.vehicleName}) - ${Math.round(s.distanceKm * 1000)}m`).join('\n');
+        }
+
+        return { success: true, stops: nearbyStops, count: nearbyStops.length, message };
+    } catch (error) {
+        return { success: false, stops: [], count: 0, message: 'Failed to find nearby stops' };
+    }
+}
+
+// ============================================================================
+// MAIN PIPELINE ORCHESTRATOR
+// ============================================================================
+
+async function executePipeline(ctx: PipelineContext): Promise<string> {
+    console.log(`[Pipeline] Starting for query: "${ctx.query}"`);
+
+    // ========================================
+    // LAYER 1: AI Intent Analysis
+    // ========================================
+    console.log('[Layer1] Analyzing intent...');
+    ctx.intent = await analyzeIntentWithAI(ctx.query);
+    console.log(`[Layer1] Intent: ${ctx.intent.primaryIntent} (${Math.round(ctx.intent.confidence * 100)}%)`);
+
+    // Publish INTENT_ANALYZED via hub
+    ctx.hub.publish({
+        type: MessageType.INTENT_ANALYZED,
+        source: 'IntentAgent',
+        payload: {
+            primaryIntent: ctx.intent.primaryIntent,
+            subIntents: ctx.intent.subIntents,
+            entities: ctx.intent.entities,
+            confidence: ctx.intent.confidence,
+            reasoning: ctx.intent.reasoning
+        },
+        priority: MessagePriority.HIGH
+    });
+
+    // Handle GENERAL intent immediately
+    if (ctx.intent.primaryIntent === 'GENERAL') {
+        ctx.hub.reset(); // Clean up hub
+        return '👋 Hello! I can help you find bus routes, track buses, or find nearby stops. Where would you like to go?';
+    }
+
+    // ========================================
+    // DATA AGENT: Fetch LATEST data
+    // ========================================
+    console.log('[DataAgent] Fetching latest data...');
+    const dataResult = await fetchLatestData(ctx);
+    ctx.agentResults.set('DataAgent', dataResult);
+
+    // Publish DATA_READY via hub
+    if (dataResult.success) {
+        ctx.hub.publish({
+            type: MessageType.DATA_READY,
+            source: 'DataAgent',
+            payload: {
+                vehiclesCount: ctx.vehicles?.length || 0,
+                stopsCount: ctx.allStops?.length || 0,
+                liveLocationsCount: ctx.latestLocations?.length || 0
+            },
+            priority: MessagePriority.HIGH
+        });
+    }
+
+    if (!dataResult.success) {
+        ctx.hub.reset(); // Clean up hub
+        return 'Could not fetch data. Please try again.';
+    }
+
+    // ========================================
+    // MEMORY AGENT: RAG context retrieval
+    // ========================================
+    console.log('[MemoryAgent] Retrieving context...');
+    const memoryResult = await retrieveMemoryContext(ctx);
+    ctx.agentResults.set('MemoryAgent', memoryResult);
+
+    // ========================================
+    // LAYER 2: Location Filter (3km Radius)
+    // ========================================
+    if (ctx.userLocation && ctx.allStops && ctx.vehicles) {
+        console.log('[Layer2] Filtering stops within 3km...');
+        ctx.filteredStops = filterStopsBy3kmRadius(
+            ctx.userLocation.latitude,
+            ctx.userLocation.longitude,
+            ctx.allStops,
+            ctx.vehicles
+        );
+        console.log(`[Layer2] Found ${ctx.filteredStops.length} stops within 3km`);
+    }
+
+    // ========================================
+    // LAYER 3: Nearest Stop Selection (KNN)
+    // ========================================
+    if (ctx.filteredStops && ctx.filteredStops.length > 0) {
+        console.log('[Layer3] Selecting nearest stops...');
+        ctx.nearestStops = knnNearestStops(ctx.filteredStops, 5);
+
+        // Find alternatives if requested
+        if (ctx.intent.subIntents.includes('alternative_options')) {
+            const alts = findAlternativeStops(ctx.filteredStops, ctx.intent);
+            ctx.nearestStops = [...ctx.nearestStops, ...alts];
+        }
+        console.log(`[Layer3] Selected ${ctx.nearestStops.length} nearest stops`);
+    }
+
+    // ========================================
+    // LAYER 4: Bus Filtering (LATEST coordinates)
+    // ========================================
+    if (ctx.nearestStops && ctx.vehicles && ctx.latestLocations && ctx.allStops) {
+        console.log('[Layer4] Filtering buses by stops...');
+        const latestMap = getLatestBusLocations(ctx.latestLocations);
+        ctx.filteredBuses = filterBusesByStops(ctx.nearestStops, ctx.vehicles, latestMap, ctx.allStops);
+        console.log(`[Layer4] Found ${ctx.filteredBuses.length} buses passing through selected stops`);
+    }
+
+    // ========================================
+    // INTENT-SPECIFIC AGENTS
+    // ========================================
+    switch (ctx.intent.primaryIntent) {
+        case 'FIND_ROUTE':
+            console.log('[RouteAgent] Finding routes...');
+            const routeResult = await findRoutes(ctx);
+            ctx.agentResults.set('RouteAgent', routeResult);
+            break;
+
+        case 'TRACK_BUS':
+            console.log('[TrackerAgent] Tracking bus...');
+            const trackerResult = await trackBus(ctx);
+            ctx.agentResults.set('TrackerAgent', trackerResult);
+            break;
+
+        case 'FIND_NEARBY':
+            // Already handled by Layer 2/3
+            break;
+    }
+
+    // ========================================
+    // GEOCODING AGENT: Place name enrichment
+    // ========================================
+    console.log('[GeocodingAgent] Enriching locations...');
+    const geoResult = await enrichWithPlaceNames(ctx);
+    ctx.agentResults.set('GeocodingAgent', geoResult);
+
+    // ========================================
+    // WALKING DIRECTIONS AGENT: Get route to nearest stop
+    // ========================================
+    if (ctx.userLocation && ctx.nearestStops && ctx.nearestStops.length > 0) {
+        console.log('[WalkingDirectionsAgent] Getting walking directions...');
+        const walkResult = await getWalkingDirectionsFromMapbox(ctx);
+        ctx.agentResults.set('WalkingDirectionsAgent', walkResult);
+    }
+
+    // ========================================
+    // BUS PREDICTION AGENT: Arrival predictions
+    // ========================================
+    if (ctx.nearestStops && ctx.nearestStops.length > 0 && ctx.latestLocations && ctx.latestLocations.length > 0) {
+        console.log('[BusPredictionAgent] Predicting arrivals...');
+        const predictionResult = await predictBusArrivals(ctx);
+        ctx.agentResults.set('BusPredictionAgent', predictionResult);
+    }
+
+    // ========================================
+    // LAYER 5: AI Response (Grounded)
+    // ========================================
+    console.log('[Layer5] Generating grounded response...');
+    const response = await generateGroundedResponse(ctx.query, ctx);
+    console.log('[Pipeline] Complete');
+
+    return response;
+}
+
+// ============================================================================
+// CORS & HTTP HANDLER
 // ============================================================================
 
 const corsHeaders = {
@@ -2834,326 +2927,114 @@ const corsHeaders = {
     'Access-Control-Allow-Methods': 'POST, OPTIONS'
 };
 
-// ============================================================================
-// MAIN HANDLER
-// ============================================================================
-
 serve(async (req: Request) => {
     if (req.method === 'OPTIONS') {
         return new Response('ok', { headers: corsHeaders });
     }
 
     if (req.method !== 'POST') {
-        return new Response(JSON.stringify({ error: 'Method not allowed' }), { status: 405, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+            status: 405,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
     }
 
     try {
-        const request: ProcessQueryRequest = await req.json();
-        const { userId, query, userLocation, useLLM = true } = request;
+        const { userId, query, userLocation } = await req.json();
 
         if (!userId || !query) {
-            return new Response(JSON.stringify({ error: 'userId and query required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+            return new Response(JSON.stringify({ error: 'userId and query required' }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
         }
 
-        console.log(`[ORCHESTRATOR] Processing: "${query}" | LLM: ${useLLM}`);
+        // ============================================
+        // INTENT-BASED ROUTING (Phase 2)
+        // Fast-path to specialized endpoints for common query types
+        // ============================================
+        const routeDecision = routeByIntent(query, userLocation);
+        console.log(`[Router] Intent: ${routeDecision.endpoint} (${Math.round(routeDecision.confidence * 100)}%) - ${routeDecision.reasoning}`);
 
-        const context = createContext(userId, query, userLocation);
-        const llmUsage = { intentAnalysis: false, resultSynthesis: false };
+        if (shouldUseSpecializedEndpoint(routeDecision)) {
+            console.log(`[Router] Delegating to specialized endpoint: ${routeDecision.endpoint}`);
 
-        // Step 1: Analyze Intent (LLM or fallback)
-        trace(context, 'LLM_CALL', 'Analyzing intent...');
-        let analyzedIntent: AnalyzedIntent;
-
-        if (useLLM) {
-            analyzedIntent = await analyzeIntent(query, !!userLocation);
-            llmUsage.intentAnalysis = analyzedIntent.reasoning.startsWith('[LLM]');
-        } else {
-            analyzedIntent = fallbackIntentAnalysis(query);
-        }
-
-        trace(context, 'INTENT_DETECTED', `Intent: ${analyzedIntent.intent} (${Math.round(analyzedIntent.confidence * 100)}%)`);
-
-        // Step 2: Handle special intents
-        if (analyzedIntent.intent === 'GENERAL') {
-            return new Response(JSON.stringify({
-                success: true,
-                response: '👋 Hello! I can help you find bus routes, track buses, or get ETAs. Where would you like to go?',
-                intent: 'GENERAL',
-                confidence: 1.0,
-                agentTrace: context.executionTrace,
-                executionTimeMs: Date.now() - context.startTime,
-                llmUsage
-            } as ProcessQueryResponse), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-        }
-
-        // Handle USER_LOCATION intent - user asking about their location
-        if (analyzedIntent.intent === 'USER_LOCATION') {
-            // First run DataAgent to get all data
-            const dataResult = await DataAgent.execute(context, { intent: 'USER_LOCATION', parameters: {} });
-            context.agentResults.set('DataAgent', dataResult);
-
-            // Then run UserContextAgent
-            const userContextResult = await UserContextAgent.execute(context, { intent: 'USER_LOCATION', parameters: {} });
-            context.agentResults.set('UserContextAgent', userContextResult);
-
-            let response: string;
-            if (userContextResult.success) {
-                const data = userContextResult.data;
-                const nearbyStops = data.nearby_stops as Array<{ name: string; distanceKm: number }> || [];
-                const nearbyBuses = data.nearby_buses as Array<{ busName: string; distanceKm: number }> || [];
-
-                let parts: string[] = [];
-                parts.push(`📍 **Your Location**: ${(data.user_lat as number)?.toFixed(5)}, ${(data.user_lng as number)?.toFixed(5)}`);
-
-                if (nearbyStops.length > 0) {
-                    parts.push(`🚏 **Nearest Stop**: ${nearbyStops[0].name} (${(nearbyStops[0].distanceKm * 1000).toFixed(0)}m)`);
-                }
-                if (nearbyBuses.length > 0) {
-                    parts.push(`🚌 **Nearby Buses**: ${nearbyBuses.map(b => b.busName).join(', ')}`);
-                }
-
-                response = parts.join('\n');
-            } else {
-                response = '❌ Could not determine your location. Please enable GPS and share your location.';
-            }
-
-            return new Response(JSON.stringify({
-                success: userContextResult.success,
-                response,
-                intent: 'USER_LOCATION',
-                confidence: userContextResult.confidence,
-                routeData: userContextResult.data,
-                agentTrace: context.executionTrace,
-                executionTimeMs: Date.now() - context.startTime,
-                llmUsage
-            } as ProcessQueryResponse), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-        }
-
-        // Step 3: Execute agents
-        const agentInput: AgentInput = {
-            intent: analyzedIntent.intent,
-            parameters: {
-                origin: analyzedIntent.entities.origin,
-                destination: analyzedIntent.entities.destination,
-                bus_id: analyzedIntent.entities.busId,
-                vehicle_name: analyzedIntent.entities.busName,
-                user_lat: userLocation?.latitude,
-                user_lng: userLocation?.longitude
-            }
-        };
-
-        // Always run DataAgent first
-        const dataResult = await DataAgent.execute(context, agentInput);
-        context.agentResults.set('DataAgent', dataResult);
-
-        if (!dataResult.success) {
-            return new Response(JSON.stringify({
-                success: false,
-                response: 'Could not fetch data. Please try again.',
-                intent: analyzedIntent.intent,
-                confidence: 0,
-                agentTrace: context.executionTrace,
-                executionTimeMs: Date.now() - context.startTime,
-                llmUsage
-            } as ProcessQueryResponse), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
-        }
-
-        // ====================================================================
-        // LOCATION-AWARE ANALYSIS: Run UserContextAgent if GPS is available
-        // This provides proximity-based context to ALL subsequent agents
-        // ====================================================================
-        if (userLocation) {
-            trace(context, 'LOCATION_CONTEXT', `User GPS: ${userLocation.latitude.toFixed(5)}, ${userLocation.longitude.toFixed(5)}`);
-            const userContextResult = await UserContextAgent.execute(context, agentInput);
-            context.agentResults.set('UserContextAgent', userContextResult);
-
-            if (userContextResult.success) {
-                const nearbyData = userContextResult.data;
-                trace(context, 'LOCATION_ANALYSIS', `Nearby: ${nearbyData.nearby_stops_count} stops, ${nearbyData.nearby_buses_count} live buses`);
-
-                // Store proximity data for AI analysis
-                setData(context, 'user_proximity_context', {
-                    hasGPS: true,
-                    userLat: userLocation.latitude,
-                    userLng: userLocation.longitude,
-                    nearestStop: nearbyData.closest_stop,
-                    nearestStopDistance: nearbyData.closest_stop_distance,
-                    nearbyBuses: nearbyData.nearby_buses,
-                    nearbyStops: nearbyData.nearby_stops
+            try {
+                const delegatedResponse = await delegateToEndpoint(routeDecision, userLocation, userId);
+                return new Response(JSON.stringify(delegatedResponse), {
+                    headers: { ...corsHeaders, 'Content-Type': 'application/json' }
                 });
-            }
-        } else {
-            trace(context, 'LOCATION_CONTEXT', 'No GPS available - using stop-based routing only');
-            setData(context, 'user_proximity_context', { hasGPS: false });
-        }
-
-        // ====================================================================
-        // MEMORY AGENT: Retrieve relevant context via RAG before processing
-        // This provides historical context and knowledge to improve accuracy
-        // ====================================================================
-        trace(context, 'MEMORY_PIPELINE', 'Running MemoryAgent for RAG context retrieval');
-        const memoryResult = await MemoryAgent.execute(context, agentInput);
-        context.agentResults.set('MemoryAgent', memoryResult);
-
-        if (memoryResult.success) {
-            const memData = memoryResult.data;
-            trace(context, 'MEMORY_CONTEXT', `Retrieved: ${memData.similar_queries_count} similar queries, ${memData.knowledge_count} knowledge items`);
-
-            // If we found similar past queries, use them to improve response
-            const memoryContext = getData<MemoryContext>(context, 'memory_context');
-            if (memoryContext && memoryContext.similarQueries.length > 0) {
-                const bestMatch = memoryContext.similarQueries[0];
-                if (bestMatch.similarity > 0.85) {
-                    trace(context, 'MEMORY_HINT', `High similarity (${(bestMatch.similarity * 100).toFixed(0)}%) to past query: "${bestMatch.query}"`);
-                }
+            } catch (delegateError) {
+                console.warn(`[Router] Delegation failed, falling back to pipeline:`, delegateError);
+                // Fall through to full pipeline
             }
         }
 
-        // ====================================================================
-        // ALGORITHM AGENT: Run OR algorithms before domain-specific agents
-        // This computes KNN, TSP, Fixed Route Matching, MCDA and shares results
-        // ====================================================================
-        trace(context, 'ALGORITHM_PIPELINE', 'Running AlgorithmAgent to compute OR algorithms');
-        const algorithmResult = await AlgorithmAgent.execute(context, agentInput);
-        context.agentResults.set('AlgorithmAgent', algorithmResult);
+        // ============================================
+        // FULL PIPELINE (for complex/ambiguous queries)
+        // ============================================
 
-        if (algorithmResult.success) {
-            trace(context, 'ALGORITHM_COMPLETE', `AlgorithmAgent: ${algorithmResult.message}`);
-        }
-
-        // Run other agents based on intent (now with algorithm results available)
-        const otherAgents = analyzedIntent.requiredAgents
-            .filter(name => name !== 'DataAgent' && name !== 'UserContextAgent' && name !== 'AlgorithmAgent' && AGENTS[name])
-            .map(name => AGENTS[name]);
-
-        // Sequential execution for proper data flow between agents
-        trace(context, 'AGENT_PIPELINE', `Running ${otherAgents.length} agents sequentially for data flow`);
-        for (const agent of otherAgents) {
-            const result = await agent.execute(context, agentInput);
-            context.agentResults.set(agent.name, result);
-            trace(context, 'AGENT_COMPLETE', `${agent.name}: ${result.success ? 'success' : 'failed'}`);
-        }
-
-        // Step 4: Get results
-        const routeData = getData<Record<string, unknown>>(context, 'best_route');
-        const hasSuccessfulAgent = Array.from(context.agentResults.values()).some(r => r.success);
-
-        // ====================================================================
-        // TRUE AI PIPELINE - Sequential Agent Analysis & Reasoning
-        // ====================================================================
-
-        trace(context, 'AI_PIPELINE_START', 'Beginning true AI analysis...');
-        llmUsage.resultSynthesis = true;
-
-        // Step 5a: Analyze each agent's output with LLM
-        const agentAnalyses: AgentAnalysis[] = [];
-
-        for (const [agentName, agentOutput] of context.agentResults) {
-            trace(context, 'AI_ANALYSIS', `Analyzing ${agentName} output...`);
-            const analysis = await analyzeAgentOutput(agentName, agentOutput, query);
-            agentAnalyses.push(analysis);
-            trace(context, 'AI_ANALYSIS_DONE', `${agentName}: ${analysis.evaluation} (${analysis.keyFindings.length} findings)`);
-        }
-
-        // Step 5b: Perform multi-agent reasoning with LLM (with location context)
-        trace(context, 'AI_REASONING', 'Performing cross-agent reasoning with location context...');
-
-        // Include user proximity context in reasoning
-        const proximityContext = getData<Record<string, unknown>>(context, 'user_proximity_context');
-        const enrichedRouteData = routeData ? {
-            ...routeData,
-            userProximity: proximityContext
-        } : proximityContext ? { userProximity: proximityContext } : undefined;
-
-        const reasoning = await performAIReasoning(query, agentAnalyses, enrichedRouteData);
-        trace(context, 'AI_REASONING_DONE', `Confidence: ${Math.round(reasoning.confidence * 100)}%`);
-
-        // Step 5c: Generate final response with LLM (no hardcoded responses!)
-        trace(context, 'AI_RESPONSE', 'Generating natural language response...');
-        const response = await generateAIResponse(query, reasoning, routeData);
-        trace(context, 'AI_RESPONSE_DONE', 'Response generated');
-
-        // Add AI reasoning to response for transparency
-        const aiReasoning = {
-            analyses: agentAnalyses.map(a => ({
-                agent: a.agentName,
-                evaluation: a.evaluation,
-                findings: a.keyFindings
-            })),
-            reasoning: reasoning.reasoningSteps,
-            mainFinding: reasoning.mainFinding,
-            confidence: reasoning.confidence
+        // Initialize pipeline context with communication hub
+        const ctx: PipelineContext = {
+            userId,
+            query,
+            userLocation,
+            startTime: Date.now(),
+            hub: createCommunicationHub(),
+            agentResults: new Map()
         };
 
-        // Step 7: Save search history WITH EMBEDDING for future RAG retrieval
-        const queryEmbedding = getData<number[]>(context, 'query_embedding');
-        const embeddingStr = queryEmbedding ? `[${queryEmbedding.join(',')}]` : null;
+        // Execute 5-layer pipeline
+        const response = await executePipeline(ctx);
 
+        // Save to search history
         try {
-            // Save to search_history with embedding
             await getSupabase().from('search_history').insert({
                 user_id: userId,
                 query,
-                query_embedding: embeddingStr,
-                intent: analyzedIntent.intent,
-                origin_name: analyzedIntent.entities.origin,
-                destination_name: analyzedIntent.entities.destination,
+                intent: ctx.intent?.primaryIntent || 'UNKNOWN',
+                origin_name: ctx.intent?.entities.origin,
+                destination_name: ctx.intent?.entities.destination,
                 response,
-                success: hasSuccessfulAgent,
-                confidence: reasoning.confidence,
-                execution_time_ms: Date.now() - context.startTime,
-                user_location: userLocation ? {
-                    latitude: userLocation.latitude,
-                    longitude: userLocation.longitude
-                } : null
+                success: ctx.bestRoute !== undefined || (ctx.nearestStops && ctx.nearestStops.length > 0),
+                confidence: ctx.intent?.confidence || 0.5,
+                execution_time_ms: Date.now() - ctx.startTime,
+                user_location: userLocation ? { latitude: userLocation.latitude, longitude: userLocation.longitude } : null
             });
-
-            // Also save to conversation_memory for multi-turn context
-            const sessionId = crypto.randomUUID();
-            await getSupabase().from('conversation_memory').insert([
-                {
-                    user_id: userId,
-                    session_id: sessionId,
-                    role: 'user',
-                    content: query,
-                    embedding: embeddingStr
-                },
-                {
-                    user_id: userId,
-                    session_id: sessionId,
-                    role: 'assistant',
-                    content: response,
-                    embedding: null  // Could generate embedding for response too
-                }
-            ]);
-
-            trace(context, 'MEMORY_SAVED', 'Saved query and response to memory');
         } catch (e) {
             console.error('Failed to save history:', e);
         }
 
         return new Response(JSON.stringify({
-            success: hasSuccessfulAgent,
+            success: true,
             response,
-            intent: analyzedIntent.intent,
-            confidence: reasoning.confidence,  // Use AI reasoning confidence
-            routeData,
-            agentTrace: context.executionTrace,
-            aiReasoning,  // Include AI reasoning chain for transparency
-            executionTimeMs: Date.now() - context.startTime,
-            llmUsage
-        } as ProcessQueryResponse), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+            intent: ctx.intent?.primaryIntent,
+            confidence: ctx.intent?.confidence,
+            routeData: ctx.bestRoute,
+            alternatives: ctx.alternatives,
+            nearbyStops: ctx.nearestStops?.slice(0, 3).map(s => ({
+                name: s.stop.name,
+                distance: s.distanceKm,
+                walkTime: s.walkTimeMinutes,
+                bus: s.vehicleName
+            })),
+            executionTimeMs: Date.now() - ctx.startTime,
+            agentResults: Object.fromEntries(
+                Array.from(ctx.agentResults.entries()).map(([k, v]) => [k, { success: v.success, message: v.message }])
+            )
+        }), {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
 
     } catch (error) {
-        console.error('Error:', error);
+        console.error('Pipeline error:', error);
         return new Response(JSON.stringify({
             success: false,
             response: 'Something went wrong. Please try again.',
-            intent: 'error',
-            confidence: 0,
-            agentTrace: [],
-            executionTimeMs: 0,
             error: error instanceof Error ? error.message : 'Unknown error'
-        } as ProcessQueryResponse), { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+        }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
     }
 });

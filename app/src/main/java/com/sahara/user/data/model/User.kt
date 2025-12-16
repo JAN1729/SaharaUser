@@ -2,6 +2,8 @@ package com.sahara.user.data.model
 
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
 
 /**
  * User Model
@@ -13,15 +15,17 @@ import kotlinx.serialization.Serializable
 data class User(
     val id: String,                                      // USR-XXXXXXXX
     val phone: String,
+    @SerialName("tracking_id") val trackingId: String? = null, // u-XXXX (for real-time location tracking)
     @SerialName("first_name") val firstName: String? = null,
     @SerialName("last_name") val lastName: String? = null,
     val email: String? = null,
     @SerialName("photo_url") val photoUrl: String? = null,
     @SerialName("preferred_language") val preferredLanguage: String = "en",
     @SerialName("preferred_route_type") val preferredRouteType: String = "fastest",
-    @SerialName("accessibility_needs") val accessibilityNeeds: String? = null,
-    @SerialName("home_location") val homeLocation: SavedLocation? = null,
-    @SerialName("work_location") val workLocation: SavedLocation? = null,
+    @SerialName("accessibility_needs") val accessibilityNeeds: JsonObject? = null, // JSONB in DB
+    @SerialName("home_location") val homeLocation: JsonObject? = null,  // JSONB in DB
+    @SerialName("work_location") val workLocation: JsonObject? = null,  // JSONB in DB
+    @SerialName("saved_locations") val savedLocations: JsonElement? = null, // JSONB array in DB
     @SerialName("total_trips") val totalTrips: Int = 0,
     @SerialName("created_at") val createdAt: String? = null,
     @SerialName("updated_at") val updatedAt: String? = null,
@@ -35,6 +39,16 @@ data class User(
             val chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
             val randomPart = (1..8).map { chars.random() }.joinToString("")
             return "USR-$randomPart"
+        }
+        
+        /**
+         * Generate a unique tracking ID in format u-XXXX
+         * Used for real-time location tracking
+         */
+        fun generateTrackingId(): String {
+            val chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+            val randomPart = (1..4).map { chars.random() }.joinToString("")
+            return "u-$randomPart"
         }
     }
     

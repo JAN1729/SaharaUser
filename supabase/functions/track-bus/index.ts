@@ -9,8 +9,64 @@
 import { serve } from 'https://deno.land/std@0.168.0/http/server.ts';
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 
-import type { TrackBusRequest, TrackBusResponse, Vehicle, LiveLocation, RouteStop } from '../_shared/types.ts';
-import { haversineDistance } from '../_shared/algorithms.ts';
+// ============================================================================
+// INLINE TYPES (avoiding _shared/ import issues with Supabase bundler)
+// ============================================================================
+
+interface TrackBusRequest {
+    busId?: string;
+    busName?: string;
+}
+
+interface TrackBusResponse {
+    success: boolean;
+    busId?: string;
+    busName?: string;
+    position?: { latitude: number; longitude: number };
+    speed?: number;
+    heading?: number;
+    nearestStop?: string;
+    freshness?: 'live' | 'recent' | 'stale';
+    timestamp?: string;
+    error?: string;
+    message?: string;
+}
+
+interface Vehicle {
+    id: string;
+    name: string;
+    vehicle_number: string;
+    is_active: boolean;
+}
+
+interface LiveLocation {
+    bus_id: string;
+    latitude: number;
+    longitude: number;
+    speed: number | null;
+    heading?: number | null;
+    timestamp: string;
+}
+
+interface RouteStop {
+    id: string;
+    vehicle_id: string;
+    name: string;
+    latitude: number;
+    longitude: number;
+    stop_order: number;
+}
+
+// Haversine distance calculation (inlined from algorithms.ts)
+function haversineDistance(lat1: number, lng1: number, lat2: number, lng2: number): number {
+    const R = 6371; // Earth's radius in km
+    const dLat = (lat2 - lat1) * Math.PI / 180;
+    const dLng = (lng2 - lng1) * Math.PI / 180;
+    const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+        Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+        Math.sin(dLng / 2) * Math.sin(dLng / 2);
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
 
 const corsHeaders = {
     'Access-Control-Allow-Origin': '*',
@@ -138,6 +194,14 @@ serve(async (req: Request) => {
         const age = Date.now() - timestamp;
         const freshness = age < 2 * 60 * 1000 ? 'fresh' : age < 10 * 60 * 1000 ? 'recent' : 'stale';
 
+        // Generate AI-friendly message based on the data
+        const movingStatus = (targetLocation.speed || 0) > 2 ? 'moving' : 'stopped';
+        const speedInfo = (targetLocation.speed || 0) > 0 ? ` at ${Math.round(targetLocation.speed || 0)} km/h` : '';
+        const freshnessNote = freshness === 'stale' ? ' (location may be outdated)' : '';
+
+        const message = `📍 **${targetVehicle?.name || targetLocation.bus_id}** is currently ${movingStatus}${speedInfo} near ${nearestStop}.` +
+            `\n📏 Distance from ${nearestStop}: ${Math.round(nearestDistance * 1000)}m${freshnessNote}`;
+
         const response: TrackBusResponse = {
             success: true,
             busId: targetLocation.bus_id,
@@ -151,7 +215,8 @@ serve(async (req: Request) => {
             nearestStop,
             nearestStopDistance: Math.round(nearestDistance * 1000),
             freshness,
-            timestamp: targetLocation.timestamp
+            timestamp: targetLocation.timestamp,
+            message  // Add human-readable message
         };
 
         return new Response(

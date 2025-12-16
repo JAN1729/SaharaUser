@@ -7,6 +7,8 @@
  * - TimeAgent: Calculate ETA
  * - TrackerAgent: Track bus positions
  * - TransferAgent: Find transfer routes
+ * 
+ * All agents use the AgentCommunicationHub for inter-agent messaging.
  */
 
 import { createClient, SupabaseClient } from 'https://esm.sh/@supabase/supabase-js@2';
@@ -32,6 +34,13 @@ import {
     getData,
     getAgentResult
 } from './orchestrator.ts';
+import {
+    MessageType,
+    MessagePriority,
+    createDataReadyMessage,
+    createRouteFoundMessage,
+    createErrorMessage
+} from './agent-communication-hub.ts';
 
 // ============================================================================
 // SUPABASE CLIENT
@@ -101,10 +110,19 @@ export const DataAgent: Agent = {
                 }
             }
 
-            // Store in context
+            // Store in context (backward compatible)
             setData(context, 'vehicles', vehicles || []);
             setData(context, 'stops', stops || []);
             setData(context, 'live_locations', Array.from(latestLocations.values()));
+
+            // Publish DATA_READY via hub (new inter-agent messaging)
+            if (context.hub) {
+                context.hub.publish(createDataReadyMessage('DataAgent', {
+                    vehiclesCount: (vehicles || []).length,
+                    stopsCount: (stops || []).length,
+                    liveLocationsCount: latestLocations.size
+                }));
+            }
 
             return {
                 success: true,
@@ -201,9 +219,22 @@ export const PathAgent: Agent = {
             };
         }
 
-        // Store best route in context
+        // Store best route in context (backward compatible)
         setData(context, 'best_route', result.bestRoute);
         setData(context, 'alternatives', result.alternatives);
+
+        // Publish ROUTE_FOUND via hub (new inter-agent messaging)
+        if (context.hub) {
+            const stopsInPath = result.bestRoute.stopsInPath || [];
+            context.hub.publish(createRouteFoundMessage('PathAgent', {
+                vehicleId: result.bestRoute.vehicleId,
+                vehicleName: result.bestRoute.vehicleName,
+                originStop: stopsInPath[0] || origin,
+                destinationStop: stopsInPath[stopsInPath.length - 1] || destination,
+                etaMinutes: result.bestRoute.etaMinutes,
+                alternativesCount: (result.alternatives || []).length
+            }));
+        }
 
         return {
             success: true,

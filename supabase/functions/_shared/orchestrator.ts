@@ -15,6 +15,7 @@ import type {
     TraceEvent,
     TraceEventType
 } from './types.ts';
+import { createCommunicationHub } from './agent-communication-hub.ts';
 
 // ============================================================================
 // AGENT INTERFACE
@@ -43,7 +44,8 @@ export function createContext(
         sharedData: new Map(),
         agentResults: new Map(),
         executionTrace: [],
-        startTime: Date.now()
+        startTime: Date.now(),
+        hub: createCommunicationHub()
     };
 }
 

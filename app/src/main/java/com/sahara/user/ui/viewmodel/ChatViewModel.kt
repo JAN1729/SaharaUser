@@ -6,6 +6,7 @@ import com.sahara.user.data.api.SupabaseApiClient
 import com.sahara.user.data.model.User
 import com.sahara.user.data.repository.AgentRepository
 import com.sahara.user.service.LocationService
+import com.sahara.user.service.UserLocationSyncManager
 import com.sahara.user.ui.screens.ChatMessage
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -27,7 +28,8 @@ import javax.inject.Inject
 class ChatViewModel @Inject constructor(
     private val agentRepository: AgentRepository,
     private val supabaseClient: SupabaseApiClient,
-    private val locationService: LocationService
+    private val locationService: LocationService,
+    private val userLocationSyncManager: UserLocationSyncManager
 ) : ViewModel() {
     
     companion object {
@@ -85,6 +87,21 @@ class ChatViewModel @Inject constructor(
         result.onSuccess { user ->
             _currentUser.value = user
             android.util.Log.d(TAG, "User initialized: ${user.id}")
+            
+            // Initialize location sync with user ID
+            userLocationSyncManager.initialize(
+                userId = user.id,
+                trackingId = user.trackingId
+            )
+            android.util.Log.d(TAG, "Location sync initialized with trackingId: ${userLocationSyncManager.getTrackingId()}")
+            
+            // If location permission is already granted, start syncing immediately
+            if (locationService.hasLocationPermission()) {
+                locationService.startLocationUpdates()
+                userLocationSyncManager.startSyncing()
+                _hasLocationPermission.value = true
+                android.util.Log.d(TAG, "Location permission already granted, started sync automatically")
+            }
         }.onFailure { error ->
             android.util.Log.e(TAG, "Failed to initialize user: ${error.message}")
         }
@@ -97,6 +114,12 @@ class ChatViewModel @Inject constructor(
     fun onLocationPermissionGranted() {
         _hasLocationPermission.value = true
         locationService.startLocationUpdates()
+        
+        // Start real-time location syncing to Supabase (every 10 seconds)
+        if (_currentUser.value != null) {
+            userLocationSyncManager.startSyncing()
+            android.util.Log.d(TAG, "Started real-time location sync to Supabase")
+        }
         android.util.Log.d(TAG, "Location permission granted, starting updates")
     }
 
@@ -227,6 +250,13 @@ class ChatViewModel @Inject constructor(
     }
     
     // ==================== UI ACTIONS ====================
+    
+    override fun onCleared() {
+        super.onCleared()
+        userLocationSyncManager.stopSyncing()
+        locationService.stopLocationUpdates()
+        android.util.Log.d(TAG, "ViewModel cleared, stopped location sync")
+    }
     
     fun clearChat() {
         _messages.value = emptyList()

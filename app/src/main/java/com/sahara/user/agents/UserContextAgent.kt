@@ -203,8 +203,13 @@ class UserContextAgent @Inject constructor(
     ): Map<String, Boolean> {
         if (user == null) return emptyMap()
         
-        val homeName = user.homeLocation?.name ?: ""
-        val workName = user.workLocation?.name ?: ""
+        // Extract "name" field from JSONB objects safely
+        val homeName = user.homeLocation?.get("name")?.let { 
+            try { (it as? kotlinx.serialization.json.JsonPrimitive)?.content } catch (e: Exception) { null }
+        } ?: ""
+        val workName = user.workLocation?.get("name")?.let { 
+            try { (it as? kotlinx.serialization.json.JsonPrimitive)?.content } catch (e: Exception) { null }
+        } ?: ""
         
         return mapOf(
             "origin_is_home" to (origin.contains("home", ignoreCase = true) || 

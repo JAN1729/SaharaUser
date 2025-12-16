@@ -251,4 +251,88 @@ class SupabaseApiClient @Inject constructor() {
             Result.failure(e)
         }
     }
+    
+    // ==================== USER LOCATION TRACKING ====================
+    
+    /**
+     * Update user's tracking ID (u-XXXX format)
+     */
+    suspend fun updateUserTrackingId(userId: String, trackingId: String): Result<Unit> {
+        return try {
+            client.from("users")
+                .update(mapOf("tracking_id" to trackingId)) {
+                    filter { eq("id", userId) }
+                }
+            android.util.Log.d(TAG, "Updated tracking ID for $userId: $trackingId")
+            Result.success(Unit)
+        } catch (e: Exception) {
+            android.util.Log.e(TAG, "Tracking ID update error: ${e.message}")
+            Result.failure(e)
+        }
+    }
+    
+    /**
+     * Get latest location for a user by their tracking ID
+     */
+    suspend fun getUserLocationByTrackingId(trackingId: String): Result<UserLocationDTO?> {
+        return try {
+            val location = client.from("user_locations")
+                .select {
+                    filter { eq("tracking_id", trackingId) }
+                    order("recorded_at", Order.DESCENDING)
+                    limit(1)
+                }
+                .decodeSingleOrNull<UserLocationDTO>()
+            Result.success(location)
+        } catch (e: Exception) {
+            android.util.Log.e(TAG, "Location fetch error: ${e.message}")
+            Result.failure(e)
+        }
+    }
+    
+    /**
+     * Get all recently active user locations (for AI agent coordination)
+     */
+    suspend fun getFreshUserLocations(maxAgeSeconds: Int = 60): Result<List<UserLocationDTO>> {
+        return try {
+            val cutoffTime = java.time.Instant.now()
+                .minusSeconds(maxAgeSeconds.toLong())
+                .toString()
+            
+            val locations = client.from("user_locations")
+                .select {
+                    filter { gte("recorded_at", cutoffTime) }
+                    order("recorded_at", Order.DESCENDING)
+                }
+                .decodeList<UserLocationDTO>()
+            
+            // Get latest location per user
+            val latestByUser = locations.groupBy { it.userId }
+                .mapValues { it.value.first() }
+                .values.toList()
+            
+            Result.success(latestByUser)
+        } catch (e: Exception) {
+            android.util.Log.e(TAG, "Fresh locations error: ${e.message}")
+            Result.failure(e)
+        }
+    }
 }
+
+/**
+ * User Location DTO for database queries
+ */
+@Serializable
+data class UserLocationDTO(
+    val id: String? = null,
+    @SerialName("user_id") val userId: String,
+    @SerialName("tracking_id") val trackingId: String,
+    val latitude: Double,
+    val longitude: Double,
+    val accuracy: Float? = null,
+    val speed: Float? = null,
+    val heading: Float? = null,
+    val altitude: Float? = null,
+    @SerialName("recorded_at") val recordedAt: String? = null,
+    @SerialName("synced_at") val syncedAt: String? = null
+)
