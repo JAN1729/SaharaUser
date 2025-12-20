@@ -30,7 +30,7 @@ class SupabaseApiClient @Inject constructor() {
         private const val TAG = "SupabaseClient"
     }
     
-    private val client: SupabaseClient by lazy {
+    val client: SupabaseClient by lazy {
         val url = SecureConfig.getSupabaseUrl()
         val key = SecureConfig.getSupabaseAnonKey()
         

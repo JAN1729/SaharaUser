@@ -8,13 +8,20 @@ import io.ktor.client.engine.android.*
 import io.ktor.client.plugins.contentnegotiation.*
 import io.ktor.client.plugins.logging.*
 import io.ktor.client.request.*
+import io.ktor.client.statement.*
 import io.ktor.http.*
 import io.ktor.serialization.kotlinx.json.*
+import io.ktor.utils.io.*
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonElement
 import javax.inject.Inject
 import javax.inject.Singleton
+import com.sahara.user.data.model.ViewportState
+import com.sahara.user.data.model.MapCommand
 
 /**
  * Agent API Client
@@ -50,6 +57,12 @@ class AgentApiClient @Inject constructor() {
                 }
             }
         }
+        // Increased timeout for AI processing with OpenRouter
+        install(io.ktor.client.plugins.HttpTimeout) {
+            requestTimeoutMillis = 60_000  // 60 seconds for full request
+            connectTimeoutMillis = 15_000  // 15 seconds to connect
+            socketTimeoutMillis = 60_000   // 60 seconds for socket idle
+        }
     }
     
     private val baseUrl: String by lazy {
@@ -58,6 +71,72 @@ class AgentApiClient @Inject constructor() {
     
     private val anonKey: String by lazy {
         SecureConfig.getSupabaseAnonKey()
+    }
+    
+    /**
+     * Parse SSE streaming response from Edge Function.
+     * The Edge Function sends newline-delimited JSON events like:
+     * {"type":"thinking","data":"..."}
+     * {"type":"reasoning","data":"..."} 
+     * {"type":"final_response","data":{...}}
+     * 
+     * We extract the final_response event and parse its data field.
+     * Reasoning events are collected and can be added to the response.
+     */
+    private fun parseStreamingResponse(responseBody: String): ProcessQueryResponse? {
+        try {
+            // Split by double newline (SSE delimiter)
+            val events = responseBody.split("\n\n").filter { it.isNotBlank() }
+            val collectedReasoning = mutableListOf<String>()
+            
+            for (eventStr in events) {
+                val trimmed = eventStr.trim()
+                if (trimmed.isEmpty()) continue
+                
+                try {
+                    // Parse the event wrapper
+                    val event = json.decodeFromString<SSEEvent>(trimmed)
+                    
+                    // Collect reasoning events for potential display
+                    if (event.type == "reasoning" && event.data != null) {
+                        try {
+                            val reasoningText = json.decodeFromString<String>(
+                                json.encodeToString(kotlinx.serialization.json.JsonElement.serializer(), event.data)
+                            )
+                            collectedReasoning.add(reasoningText)
+                            Log.d(TAG, "Reasoning: $reasoningText")
+                        } catch (_: Exception) {
+                            // Ignore parse errors for reasoning
+                        }
+                    }
+                    
+                    if (event.type == "final_response" && event.data != null) {
+                        // The data field contains the actual ProcessQueryResponse fields
+                        val dataStr = json.encodeToString(kotlinx.serialization.json.JsonElement.serializer(), event.data)
+                        val response = json.decodeFromString<ProcessQueryResponse>(dataStr)
+                        
+                        // If response doesn't have reasoning details, add collected ones from SSE stream
+                        return if (response.reasoningDetails.isNullOrEmpty() && collectedReasoning.isNotEmpty()) {
+                            response.copy(
+                                reasoningDetails = collectedReasoning.map { 
+                                    ReasoningDetail(type = "reasoning.text", text = it) 
+                                }
+                            )
+                        } else {
+                            response
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.d(TAG, "Skipping non-parseable event: ${trimmed.take(100)}")
+                }
+            }
+            
+            Log.w(TAG, "No final_response event found in ${events.size} events")
+            return null
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to parse streaming response: ${e.message}")
+            return null
+        }
     }
     
     // ==================== PROCESS QUERY ====================
@@ -102,12 +181,31 @@ class AgentApiClient @Inject constructor() {
                 setBody(request)
             }
             
+            // Get raw response body for debugging
+            val responseBody = response.bodyAsText()
+            Log.d(TAG, "Raw response (first 500 chars): ${responseBody.take(500)}")
+            
             if (response.status.isSuccess()) {
-                val result = response.body<ProcessQueryResponse>()
-                Log.d(TAG, "Query processed: ${result.intent}, ${result.executionTimeMs}ms")
-                Result.success(result)
+                try {
+                    // Parse SSE streaming response format
+                    // Edge Function sends: {"type":"thinking","data":"..."}\n\n{"type":"final_response","data":{...}}\n\n
+                    // We need to extract the final_response event and parse its data
+                    val result = parseStreamingResponse(responseBody)
+                    if (result != null) {
+                        Log.d(TAG, "Query processed: ${result.intent}, ${result.executionTimeMs}ms")
+                        Result.success(result)
+                    } else {
+                        Log.e(TAG, "No final_response found in stream")
+                        Result.failure(Exception("No response received from server"))
+                    }
+                } catch (parseError: Exception) {
+                    Log.e(TAG, "JSON parse error: ${parseError.message}")
+                    Log.e(TAG, "Response body: $responseBody")
+                    // Try to extract at least a message if parse fails
+                    Result.failure(Exception("Parse error: ${parseError.message}"))
+                }
             } else {
-                val error = "API error: ${response.status.value}"
+                val error = "API error: ${response.status.value} - $responseBody"
                 Log.e(TAG, error)
                 Result.failure(Exception(error))
             }
@@ -118,6 +216,159 @@ class AgentApiClient @Inject constructor() {
         }
     }
     
+    /**
+     * Stream events wrapper for real-time updates
+     */
+    sealed class StreamEvent {
+        data class Reasoning(val text: String) : StreamEvent()
+        data class Thinking(val text: String) : StreamEvent()
+        data class FinalResponse(val response: ProcessQueryResponse) : StreamEvent()
+        data class Error(val message: String) : StreamEvent()
+    }
+    
+    /**
+     * Process query with REAL-TIME streaming of reasoning tokens.
+     * Emits events as they arrive from the server SSE stream.
+     */
+    fun processQueryStreaming(
+        userId: String,
+        query: String,
+        latitude: Double? = null,
+        longitude: Double? = null,
+        viewportState: ViewportState? = null
+    ): Flow<StreamEvent> = flow {
+        Log.d(TAG, "Streaming query: ${query.take(50)}... viewport=${viewportState != null}")
+        
+        val request = ProcessQueryRequest(
+            userId = userId,
+            query = query,
+            userLocation = if (latitude != null && longitude != null) {
+                UserLocation(latitude, longitude)
+            } else null,
+            viewportState = viewportState
+        )
+        
+        try {
+            val response = client.post("$baseUrl/process-query") {
+                contentType(ContentType.Application.Json)
+                header("Authorization", "Bearer $anonKey")
+                header("apikey", anonKey)
+                setBody(request)
+            }
+            
+            if (!response.status.isSuccess()) {
+                emit(StreamEvent.Error("Server error: ${response.status.value}"))
+                return@flow
+            }
+            
+            // Get full response and split by SSE delimiter
+            // Handle both \n\n and \r\n\r\n line endings
+            val responseText = response.bodyAsText()
+            Log.d(TAG, "SSE Response length: ${responseText.length} chars")
+            Log.d(TAG, "SSE Response preview: ${responseText.take(500)}")
+            
+            // Normalize line endings and split by double newline
+            val normalizedText = responseText.replace("\r\n", "\n").replace("\r", "\n")
+            val events = normalizedText.split("\n\n").filter { it.isNotBlank() }
+            Log.d(TAG, "Found ${events.size} SSE events after normalization")
+            
+            if (events.isEmpty()) {
+                Log.w(TAG, "No SSE events found! Raw response: ${responseText.take(1000)}")
+                // Try parsing as single JSON response (non-SSE fallback)
+                try {
+                    val fallbackResponse = json.decodeFromString<ProcessQueryResponse>(responseText.trim())
+                    Log.d(TAG, "Parsed as direct JSON response (non-SSE)")
+                    emit(StreamEvent.FinalResponse(fallbackResponse))
+                    return@flow
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to parse as direct JSON: ${e.message}")
+                }
+            }
+            
+            for ((index, eventStr) in events.withIndex()) {
+                val trimmed = eventStr.trim()
+                if (trimmed.isEmpty()) continue
+                
+                Log.d(TAG, "Event $index: ${trimmed.take(150)}")
+                
+                try {
+                    val event = json.decodeFromString<SSEEvent>(trimmed)
+                    Log.d(TAG, "Processing SSE event type: ${event.type}")
+                    
+                    when (event.type) {
+                        "reasoning" -> {
+                            // Extract text from JsonElement - it could be a JsonPrimitive string
+                            val text = extractTextFromJsonElement(event.data)
+                            if (text.isNotBlank()) {
+                                Log.d(TAG, ">>> EMITTING REASONING: $text")
+                                emit(StreamEvent.Reasoning(text))
+                            }
+                        }
+                        "thinking" -> {
+                            val text = extractTextFromJsonElement(event.data)
+                            if (text.isNotBlank()) {
+                                Log.d(TAG, ">>> EMITTING THINKING: $text")
+                                emit(StreamEvent.Thinking(text))
+                            }
+                        }
+                        "final_response" -> {
+                            val dataStr = event.data?.let { 
+                                json.encodeToString(JsonElement.serializer(), it)
+                            } ?: "{}"
+                            Log.d(TAG, "Parsing final_response: ${dataStr.take(200)}...")
+                            val finalResponse = json.decodeFromString<ProcessQueryResponse>(dataStr)
+                            emit(StreamEvent.FinalResponse(finalResponse))
+                        }
+                        "error" -> {
+                            val errorText = extractTextFromJsonElement(event.data)
+                            Log.e(TAG, "Server error event: $errorText")
+                            emit(StreamEvent.Error(errorText))
+                        }
+                        else -> {
+                            Log.w(TAG, "Unknown event type: ${event.type}")
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to parse event $index: ${trimmed.take(100)}, error: ${e.message}")
+                }
+            }
+            
+        } catch (e: Exception) {
+            Log.e(TAG, "Streaming failed: ${e.message}", e)
+            emit(StreamEvent.Error(e.message ?: "Unknown error"))
+        }
+    }
+    
+    /**
+     * Helper to extract text from JsonElement - handles both primitive strings and complex objects
+     */
+    private fun extractTextFromJsonElement(element: JsonElement?): String {
+        if (element == null) return ""
+        return try {
+            when {
+                element is kotlinx.serialization.json.JsonPrimitive && element.isString -> {
+                    element.content
+                }
+                element is kotlinx.serialization.json.JsonPrimitive -> {
+                    element.content
+                }
+                else -> {
+                    // For complex objects, just convert to string representation
+                    json.encodeToString(JsonElement.serializer(), element)
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to extract text from JsonElement: ${e.message}")
+            ""
+        }
+    }
+    
+
+    @Serializable
+    private data class SSEEvent(
+        val type: String,
+        val data: JsonElement? = null
+    )
     // ==================== TRACK BUS ====================
     
     /**
@@ -216,7 +467,9 @@ class AgentApiClient @Inject constructor() {
 data class ProcessQueryRequest(
     val userId: String,
     val query: String,
-    val userLocation: UserLocation? = null
+    val userLocation: UserLocation? = null,
+    // Map-Action Pipeline: Spatial context for AI reasoning
+    @SerialName("viewportState") val viewportState: ViewportState? = null
 )
 
 @Serializable
@@ -229,12 +482,37 @@ data class UserLocation(
 data class ProcessQueryResponse(
     val success: Boolean,
     val response: String,
-    val intent: String,
-    @SerialName("routeData") val routeData: RouteData? = null,
+    val intent: String = "UNKNOWN",
+    // Use JsonElement for flexible routeData shapes from different endpoints
+    // - find-route returns: {vehicleId, vehicleName, originStop, ...}
+    // - get-nearby-stops returns: {stops: [...], count: N}
+    @SerialName("routeData") val routeData: JsonElement? = null,
     @SerialName("agentTrace") val agentTrace: List<TraceEvent> = emptyList(),
-    @SerialName("executionTimeMs") val executionTimeMs: Long,
+    @SerialName("executionTimeMs") val executionTimeMs: Long = 0,
+    // OpenRouter reasoning details for chain-of-thought display
+    @SerialName("reasoningDetails") val reasoningDetails: List<ReasoningDetail>? = null,
+    // Agentic tool calls - AI invokes map visualization when it helps
+    @SerialName("toolCalls") val toolCalls: List<com.sahara.user.data.model.AgentToolCall>? = null,
+    // Map-Action Pipeline: AI-driven map commands (HIGHLIGHT_PATH, ZOOM_TO, etc.)
+    @SerialName("map_commands") val mapCommands: List<MapCommand>? = null,
     val error: String? = null
 )
+
+/**
+ * Reasoning detail from OpenRouter's chain-of-thought.
+ * OpenRouter returns type like 'reasoning.text' with 'text' field.
+ */
+@Serializable
+data class ReasoningDetail(
+    val type: String,
+    val text: String? = null,    // OpenRouter uses 'text'
+    val content: String? = null,  // Fallback
+    val format: String? = null,
+    val index: Int? = null
+) {
+    /** Get the actual reasoning text from either field */
+    val reasoningText: String get() = text ?: content ?: ""
+}
 
 @Serializable
 data class RouteData(
@@ -255,6 +533,16 @@ data class TraceEvent(
     val type: String,
     val message: String,
     val timestamp: Long
+)
+
+/**
+ * SSE Event wrapper for streaming responses.
+ * The Edge Function sends {"type":"...", "data": ...} format.
+ */
+@Serializable
+data class StreamEvent(
+    val type: String,
+    val data: kotlinx.serialization.json.JsonElement? = null
 )
 
 @Serializable

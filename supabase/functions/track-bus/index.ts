@@ -25,9 +25,11 @@ interface TrackBusResponse {
     position?: { latitude: number; longitude: number };
     speed?: number;
     heading?: number;
+    isMoving?: boolean;
     nearestStop?: string;
-    freshness?: 'live' | 'recent' | 'stale';
-    timestamp?: string;
+    nearestStopDistance?: number;
+    freshness?: 'live' | 'fresh' | 'recent' | 'stale';
+    timestamp?: number;
     error?: string;
     message?: string;
 }
@@ -45,7 +47,7 @@ interface LiveLocation {
     longitude: number;
     speed: number | null;
     heading?: number | null;
-    timestamp: string;
+    timestamp: number;
 }
 
 interface RouteStop {
@@ -155,7 +157,7 @@ serve(async (req: Request) => {
                 nearestStop: '',
                 nearestStopDistance: 0,
                 freshness: 'stale',
-                timestamp: '',
+                timestamp: 0,
                 error: 'Bus not currently sharing location'
             };
 
@@ -190,9 +192,11 @@ serve(async (req: Request) => {
         }
 
         // Calculate freshness
-        const timestamp = new Date(targetLocation.timestamp).getTime();
+        const timestamp = typeof targetLocation.timestamp === 'string'
+            ? new Date(targetLocation.timestamp).getTime()
+            : targetLocation.timestamp;
         const age = Date.now() - timestamp;
-        const freshness = age < 2 * 60 * 1000 ? 'fresh' : age < 10 * 60 * 1000 ? 'recent' : 'stale';
+        const freshness = age < 45 * 1000 ? 'live' : age < 120 * 1000 ? 'fresh' : age < 300 * 1000 ? 'recent' : 'stale';
 
         // Generate AI-friendly message based on the data
         const movingStatus = (targetLocation.speed || 0) > 2 ? 'moving' : 'stopped';
@@ -215,7 +219,9 @@ serve(async (req: Request) => {
             nearestStop,
             nearestStopDistance: Math.round(nearestDistance * 1000),
             freshness,
-            timestamp: targetLocation.timestamp,
+            timestamp: typeof targetLocation.timestamp === 'string'
+                ? new Date(targetLocation.timestamp).getTime()
+                : targetLocation.timestamp,
             message  // Add human-readable message
         };
 

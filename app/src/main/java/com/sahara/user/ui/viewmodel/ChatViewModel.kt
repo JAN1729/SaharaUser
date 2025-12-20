@@ -3,6 +3,11 @@ package com.sahara.user.ui.viewmodel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.sahara.user.data.api.SupabaseApiClient
+import com.sahara.user.data.model.RouteMapData
+import com.sahara.user.data.model.ViewportState
+import com.sahara.user.data.model.BoundingBox
+import com.sahara.user.data.model.MapCommand
+import com.sahara.user.data.model.LatLngData
 import com.sahara.user.data.model.User
 import com.sahara.user.data.repository.AgentRepository
 import com.sahara.user.service.LocationService
@@ -13,6 +18,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.serialization.json.Json
 import java.util.UUID
 import javax.inject.Inject
 
@@ -29,13 +35,16 @@ class ChatViewModel @Inject constructor(
     private val agentRepository: AgentRepository,
     private val supabaseClient: SupabaseApiClient,
     private val locationService: LocationService,
-    private val userLocationSyncManager: UserLocationSyncManager
+    private val userLocationSyncManager: UserLocationSyncManager,
+    private val realtimeBusManager: com.sahara.user.service.RealtimeBusManager
 ) : ViewModel() {
     
     companion object {
         private const val TAG = "ChatViewModel"
         private const val TEMP_USER_ID = "USR-TEMPUSER"
     }
+    
+    private val json = Json { ignoreUnknownKeys = true; isLenient = true }
     
     // ==================== UI STATE ====================
     
@@ -53,6 +62,82 @@ class ChatViewModel @Inject constructor(
     
     private val _hasLocationPermission = MutableStateFlow(false)
     val hasLocationPermission: StateFlow<Boolean> = _hasLocationPermission.asStateFlow()
+    
+    // ==================== EPHEMERAL MAP TOOL (Agentic Feature) ====================
+    // Map visualization that the AI invokes. Ephemeral - clears when user sends new message.
+    
+    private val _activeMapTool = MutableStateFlow<RouteMapData?>(null)
+    val activeMapTool: StateFlow<RouteMapData?> = _activeMapTool.asStateFlow()
+    
+    /** Clear the active map tool (called on new message or dismiss) */
+    fun clearMapTool() {
+        _activeMapTool.value = null
+        stopRealtimeTracking()
+    }
+    
+    // ==================== MAP CONTEXT (Spatial Awareness - Map-Action Pipeline) ====================
+    // Viewport state captures what the user currently sees on the map.
+    // Sent with every query to enable spatial-aware AI responses.
+    
+    private val _viewportState = MutableStateFlow<ViewportState?>(null)
+    val viewportState: StateFlow<ViewportState?> = _viewportState.asStateFlow()
+    
+    private val _pendingMapCommands = MutableStateFlow<List<MapCommand>>(emptyList())
+    val pendingMapCommands: StateFlow<List<MapCommand>> = _pendingMapCommands.asStateFlow()
+    
+    /**
+     * Update viewport state when user pans/zooms the map.
+     * Call this from the map view's camera change listener.
+     */
+    fun updateViewportState(north: Double, south: Double, east: Double, west: Double, zoom: Float) {
+        val bounds = BoundingBox(north, south, east, west)
+        val center = bounds.center()
+        _viewportState.value = ViewportState(
+            boundingBox = bounds,
+            zoomLevel = zoom,
+            centerLat = center.first,
+            centerLng = center.second
+        )
+        android.util.Log.d(TAG, "ViewportState updated: N=$north, S=$south, E=$east, W=$west, zoom=$zoom")
+    }
+    
+    /** Clear pending map commands after execution */
+    fun clearMapCommands() {
+        _pendingMapCommands.value = emptyList()
+    }
+    
+    // ==================== REAL-TIME BUS TRACKING ====================
+    
+    private var realtimeJob: kotlinx.coroutines.Job? = null
+    
+    /**
+     * Start listening for real-time movement updates for a specific bus.
+     * Updates the activeMapTool state reactively.
+     */
+    private fun startRealtimeTracking(busId: String) {
+        realtimeJob?.cancel()
+        realtimeJob = viewModelScope.launch {
+            android.util.Log.d(TAG, "Starting real-time tracking for bus: $busId")
+            realtimeBusManager.listenForMovements(busId).collect { update ->
+                // Only update if it matches our bus_id (RealtimeBusManager might broadcast for all)
+                if (update.bus_id == busId) {
+                    _activeMapTool.value = _activeMapTool.value?.copy(
+                        busLocation = com.sahara.user.data.model.MapBusLocation(
+                            lat = update.latitude,
+                            lng = update.longitude,
+                            heading = update.heading.toDouble(),
+                            isMoving = true
+                        )
+                    )
+                }
+            }
+        }
+    }
+    
+    private fun stopRealtimeTracking() {
+        realtimeJob?.cancel()
+        realtimeJob = null
+    }
     
     // ==================== THINKING STEPS (for UI animation) ====================
     
@@ -149,24 +234,16 @@ class ChatViewModel @Inject constructor(
             )
             _messages.value = _messages.value + userMessage
             
-            // Show loading
-            _isLoading.value = true
-            _statusMessage.value = "Processing with AI agents..."
-            _activeAgents.value = listOf("DataAgent", "PathAgent", "TimeAgent")
+            // EPHEMERAL: Clear previous map visualization on new query
+            _activeMapTool.value = null
             
-            // Initialize thinking steps for UI
-            _thinkingSteps.value = listOf(
-                ThinkingStep("Parsing your request", isComplete = false, isActive = true),
-                ThinkingStep("Fetching bus data", isComplete = false, isActive = false),
-                ThinkingStep("Calculating routes", isComplete = false, isActive = false),
-                ThinkingStep("Preparing response", isComplete = false, isActive = false)
-            )
-            _agentStatus.value = AgentStatus("DataAgent", "Initializing...", isActive = true)
-            _agentPipeline.value = listOf(
-                AgentPipelineStep("Data", "active"),
-                AgentPipelineStep("Path", "pending"),
-                AgentPipelineStep("Time", "pending")
-            )
+            // Show loading with empty thinking steps (will be filled by stream)
+            _isLoading.value = true
+            _statusMessage.value = "Processing..."
+            _thinkingSteps.value = listOf(ThinkingStep("Connecting to AI...", isActive = true))
+            
+            // Track thinking duration
+            val thinkingStartTime = System.currentTimeMillis()
             
             try {
                 val userId = _currentUser.value?.id ?: TEMP_USER_ID
@@ -181,20 +258,63 @@ class ChatViewModel @Inject constructor(
                     null
                 }
                 
-                // Call Backend Edge Function via AgentRepository
-                val result = agentRepository.processQuery(
+                // Use STREAMING API for real-time reasoning display
+                var finalResponse: com.sahara.user.data.api.ProcessQueryResponse? = null
+                val reasoningSteps = mutableListOf<String>()
+                
+                android.util.Log.d(TAG, ">>> Starting stream collection...")
+                
+                agentRepository.processQueryStreaming(
                     userId = userId,
                     query = content,
                     userLat = location?.latitude,
-                    userLng = location?.longitude
-                )
+                    userLng = location?.longitude,
+                    viewportState = _viewportState.value
+                ).collect { event ->
+                    android.util.Log.d(TAG, ">>> Received event: ${event::class.simpleName}")
+                    when (event) {
+                        is com.sahara.user.data.api.AgentApiClient.StreamEvent.Reasoning -> {
+                            // Add new reasoning step in real-time
+                            android.util.Log.d(TAG, ">>> REASONING EVENT: ${event.text}")
+                            reasoningSteps.add(event.text)
+                            _thinkingSteps.value = reasoningSteps.mapIndexed { index, text ->
+                                ThinkingStep(
+                                    description = text,
+                                    isComplete = index < reasoningSteps.size - 1,
+                                    isActive = index == reasoningSteps.size - 1
+                                )
+                            }
+                            android.util.Log.d(TAG, ">>> Updated thinkingSteps: ${_thinkingSteps.value.size} items")
+                        }
+                        is com.sahara.user.data.api.AgentApiClient.StreamEvent.Thinking -> {
+                            // Show thinking status
+                            android.util.Log.d(TAG, ">>> THINKING EVENT: ${event.text}")
+                            _thinkingSteps.value = listOf(
+                                ThinkingStep(event.text, isActive = true)
+                            )
+                        }
+                        is com.sahara.user.data.api.AgentApiClient.StreamEvent.FinalResponse -> {
+                            android.util.Log.d(TAG, ">>> FINAL RESPONSE EVENT received")
+                            finalResponse = event.response
+                        }
+                        is com.sahara.user.data.api.AgentApiClient.StreamEvent.Error -> {
+                            android.util.Log.e(TAG, ">>> ERROR EVENT: ${event.message}")
+                        }
+                    }
+                }
                 
-                result.onSuccess { response ->
-                    // Update status with agents called
+                android.util.Log.d(TAG, ">>> Stream collection complete. Total reasoning steps: ${reasoningSteps.size}")
+                
+                // Mark processing complete
+                agentRepository.markProcessingComplete(finalResponse)
+                
+                // Handle final response
+                if (finalResponse != null) {
+                    val response = finalResponse!!
                     _lastAgentsCalled.value = response.agentTrace.map { it.message }
-                    _statusMessage.value = null
                     
-                    // Add AI response
+                    // Add AI response to chat
+                    val thinkingDuration = System.currentTimeMillis() - thinkingStartTime
                     val aiMessage = ChatMessage(
                         id = UUID.randomUUID().toString(),
                         content = response.response,
@@ -203,24 +323,54 @@ class ChatViewModel @Inject constructor(
                             "intent" to response.intent,
                             "execution_time_ms" to response.executionTimeMs.toString(),
                             "success" to response.success.toString()
-                        )
+                        ),
+                        thinkingSteps = reasoningSteps.toList(),
+                        thinkingDurationMs = thinkingDuration
                     )
                     _messages.value = _messages.value + aiMessage
                     
-                    // Log for debugging
+                    // AGENTIC: Set map tool if AI invoked it
+                    response.toolCalls?.firstOrNull()?.let { toolCall ->
+                        if (toolCall.tool in listOf("show_route_map", "show_bus_location", "show_nearby_stops")) {
+                            try {
+                                toolCall.data?.let { dataElement ->
+                                    val mapData = json.decodeFromJsonElement(
+                                        RouteMapData.serializer(),
+                                        dataElement
+                                    )
+                                    _activeMapTool.value = mapData
+                                    android.util.Log.d(TAG, ">>> MAP TOOL ACTIVATED: ${toolCall.tool} with ${mapData.stopsToMark.size} stops")
+                                    
+                                    // Start real-time tracking if we have a vehicle ID
+                                    if (mapData.vehicleId.isNotBlank()) {
+                                        startRealtimeTracking(mapData.vehicleId)
+                                    }
+                                }
+                            } catch (e: Exception) {
+                                android.util.Log.w(TAG, "Failed to parse map tool data: ${e.message}")
+                            }
+                        }
+                    }
+                    
+                    // MAP-ACTION PIPELINE: Handle AI-driven map commands
+                    response.mapCommands?.let { commands ->
+                        if (commands.isNotEmpty()) {
+                            _pendingMapCommands.value = commands
+                            android.util.Log.d(TAG, ">>> MAP COMMANDS RECEIVED: ${commands.size} commands")
+                            commands.forEach { cmd ->
+                                android.util.Log.d(TAG, "    - ${cmd.action}: ${cmd.message ?: cmd.targetBusId ?: "no target"}")
+                            }
+                        }
+                    }
+                    
                     android.util.Log.d(TAG, "Query: $content")
                     android.util.Log.d(TAG, "Intent: ${response.intent}")
-                    android.util.Log.d(TAG, "Response: ${response.response}")
-                    android.util.Log.d(TAG, "Execution time: ${response.executionTimeMs}ms")
-                    
-                }.onFailure { error ->
-                    android.util.Log.e(TAG, "API Error: ${error.message}", error)
-                    
-                    _statusMessage.value = null
-                    
+                    android.util.Log.d(TAG, "Response: ${response.response.take(100)}...")
+                } else {
+                    // No response received
                     val errorMessage = ChatMessage(
                         id = UUID.randomUUID().toString(),
-                        content = "Sorry, couldn't connect to the server. Please try again.",
+                        content = "Sorry, couldn't get a response. Please try again.",
                         isUser = false
                     )
                     _messages.value = _messages.value + errorMessage
@@ -228,8 +378,6 @@ class ChatViewModel @Inject constructor(
                 
             } catch (e: Exception) {
                 android.util.Log.e(TAG, "Error: ${e.message}", e)
-                
-                _statusMessage.value = null
                 
                 val errorMessage = ChatMessage(
                     id = UUID.randomUUID().toString(),
@@ -241,14 +389,11 @@ class ChatViewModel @Inject constructor(
             } finally {
                 _isLoading.value = false
                 _statusMessage.value = null
-                _activeAgents.value = emptyList()
                 _thinkingSteps.value = emptyList()
-                _agentStatus.value = null
-                _agentPipeline.value = emptyList()
             }
         }
     }
-    
+
     // ==================== UI ACTIONS ====================
     
     override fun onCleared() {
@@ -266,6 +411,7 @@ class ChatViewModel @Inject constructor(
         _thinkingSteps.value = emptyList()
         _agentStatus.value = null
         _agentPipeline.value = emptyList()
+        _activeMapTool.value = null  // Clear ephemeral map
     }
     
     suspend fun getCurrentLocation() = locationService.getCurrentLocation()

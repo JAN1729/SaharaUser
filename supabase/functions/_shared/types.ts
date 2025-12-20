@@ -35,7 +35,8 @@ export interface LiveLocation {
   longitude: number;
   speed: number | null;
   heading: number | null;
-  timestamp: string;
+  timestamp: number;
+  location_ts?: number;
 }
 
 // ============================================================================
@@ -194,7 +195,7 @@ export interface TrackBusResponse {
   nearestStop: string;
   nearestStopDistance: number;
   freshness: 'fresh' | 'recent' | 'stale';
-  timestamp: string;
+  timestamp: number;
   message?: string;  // AI-generated human-readable status
   error?: string;
 }

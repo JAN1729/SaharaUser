@@ -115,7 +115,11 @@ function routeByIntent(query: string, userLocation?: { latitude: number; longitu
 }
 
 function shouldUseSpecializedEndpoint(decision: RouteDecision): boolean {
-    return decision.endpoint !== EndpointType.PROCESS_QUERY && decision.confidence >= 0.75;
+    // DISABLED: Force all queries through full pipeline to use OpenRouter reasoning
+    // The specialized endpoints don't support OpenRouter reasoning_details
+    // To re-enable, uncomment the line below:
+    // return decision.endpoint !== EndpointType.PROCESS_QUERY && decision.confidence >= 0.75;
+    return false;
 }
 
 // Confidence tier (inlined from agent-priority.ts)
@@ -156,12 +160,100 @@ const EARTH_RADIUS_KM = 6371;
 const WALKING_SPEED_KMH = 4.5;
 const DEFAULT_BUS_SPEED_KMH = 18;
 
-// LLM Configuration
-const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
-const GROQ_MODEL_FAST = 'llama-3.1-8b-instant';
-const GROQ_MODEL_QUALITY = 'llama-3.3-70b-versatile';
+// LLM Configuration - OpenRouter API with Reasoning
+const OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions';
+const OPENROUTER_MODEL = 'openai/gpt-oss-120b';
+const OPENROUTER_HEADERS = {
+    'HTTP-Referer': 'https://sahara-bus.app', // For OpenRouter leaderboard
+    'X-Title': 'Sahara Bus AI Assistant'      // App name for leaderboard
+};
 const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
 const GEMINI_MODEL = 'gemini-2.5-flash';
+
+// OpenRouter Reasoning Types - matches actual API response format
+interface OpenRouterReasoningDetail {
+    type: string;  // Can be 'reasoning.text', 'thought', 'summary', etc.
+    text?: string;  // OpenRouter uses 'text' not 'content'
+    content?: string;  // Some formats use 'content'
+    format?: string;
+    index?: number;
+}
+
+interface OpenRouterMessage {
+    role: 'user' | 'assistant' | 'system';
+    content: string;
+    reasoning_details?: OpenRouterReasoningDetail[];
+}
+
+// ============================================================================
+// AGENT AI HELPER - Lightweight AI for sub-agent decisions
+// ============================================================================
+
+/**
+ * Lightweight AI call for sub-agent analysis.
+ * Uses a faster model for quick decisions without full reasoning overhead.
+ * Returns structured JSON analysis that agents can use for smarter outputs.
+ */
+async function callAgentAI<T>(
+    agentName: string,
+    systemPrompt: string,
+    dataPrompt: string,
+    parseAs: 'json' | 'text' = 'json'
+): Promise<{ success: boolean; result: T | null; error?: string }> {
+    const apiKey = Deno.env.get('OPENROUTER_API_KEY');
+
+    if (!apiKey) {
+        console.log(`[${agentName}] No API key, using rule-based logic`);
+        return { success: false, result: null, error: 'No API key' };
+    }
+
+    try {
+        const response = await fetch(OPENROUTER_API_URL, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${apiKey}`,
+                'Content-Type': 'application/json',
+                ...OPENROUTER_HEADERS
+            },
+            body: JSON.stringify({
+                model: OPENROUTER_MODEL,
+                messages: [
+                    { role: 'system', content: systemPrompt },
+                    { role: 'user', content: dataPrompt }
+                ],
+                temperature: 0.1,  // Low temperature for consistent analysis
+                max_tokens: 300   // Keep responses concise for speed
+            })
+        });
+
+        if (!response.ok) {
+            const errText = await response.text();
+            console.warn(`[${agentName}] AI call failed: ${response.status}`);
+            return { success: false, result: null, error: errText.substring(0, 200) };
+        }
+
+        const data = await response.json();
+        const content = data.choices[0]?.message?.content?.trim();
+
+        if (!content) {
+            return { success: false, result: null, error: 'Empty response' };
+        }
+
+        if (parseAs === 'json') {
+            // Extract JSON from possible markdown code blocks
+            const jsonMatch = content.match(/```(?:json)?\s*([\s\S]*?)```/) || [null, content];
+            const jsonStr = jsonMatch[1] || content;
+            const parsed = JSON.parse(jsonStr) as T;
+            console.log(`[${agentName}] AI analysis complete`);
+            return { success: true, result: parsed };
+        } else {
+            return { success: true, result: content as T };
+        }
+    } catch (e) {
+        console.warn(`[${agentName}] AI error:`, e);
+        return { success: false, result: null, error: e instanceof Error ? e.message : 'AI call failed' };
+    }
+}
 
 // ============================================================================
 // TYPES
@@ -181,6 +273,9 @@ interface RouteStop {
     latitude: number;
     longitude: number;
     stop_order: number;
+    distance_km?: number;
+    match_rank?: number;
+    match_source?: string;
 }
 
 interface LiveLocation {
@@ -190,6 +285,7 @@ interface LiveLocation {
     speed: number | null;
     heading: number | null;
     timestamp: number;
+    location_ts?: number; // Added to handle DB RPC response
     trip_status?: 'started' | 'stopped';
     accuracy?: number;
 }
@@ -224,6 +320,7 @@ interface AnalyzedIntent {
 interface FilteredStop {
     stop: RouteStop;
     distanceKm: number;
+    distance_km?: number; // Unified with DB field
     walkTimeMinutes: number;
     vehicleName: string;
     vehicleId: string;
@@ -258,9 +355,119 @@ interface RouteResult {
     walkTimeMinutes?: number;
     walkDistanceMeters?: number;
     routeScore?: number; // Composite score for sorting (live + ETA + freshness)
+    isDirectRoute?: boolean; // True if no transfers needed
+}
+
+// ============================================================================
+// MULTI-HOP ROUTE TYPES (Routes with transfers)
+// ============================================================================
+
+// Single leg of a multi-hop route
+interface RouteLeg {
+    type: 'bus' | 'walk';
+    vehicleId?: string;
+    vehicleName?: string;
+    vehicleNumber?: string;
+    originStop: string;
+    destinationStop: string;
+    etaMinutes: number;
+    distanceKm: number;
+    stopsInPath?: string[];
+    isLive?: boolean;
+}
+
+// Multi-hop route with one or more transfers
+interface MultiHopRoute {
+    legs: RouteLeg[];
+    totalEtaMinutes: number;
+    totalDistanceKm: number;
+    transferCount: number;
+    routeScore: number;
+    summary: string; // e.g., "Bus 335E → Walk → Bus 500C"
+}
+
+// ============================================================================
+// AGENTIC MAP TOOL TYPES
+// ============================================================================
+
+// Stop coordinate for map marking
+interface MapStopCoordinate {
+    name: string;
+    lat: number;
+    lng: number;
+    order: number;
+    isOrigin?: boolean;
+    isDestination?: boolean;
+}
+
+// Bus location marker
+interface MapBusLocation {
+    lat: number;
+    lng: number;
+    heading?: number;
+    isMoving?: boolean;
+}
+
+// Map bounding box for auto-zoom
+interface MapBounds {
+    north: number;
+    south: number;
+    east: number;
+    west: number;
+}
+
+// Map-Action Pipeline: Viewport state sent from Android client
+interface ViewportState {
+    boundingBox: {
+        north: number;
+        south: number;
+        east: number;
+        west: number;
+    };
+    zoomLevel: number;
+    centerLat: number;
+    centerLng: number;
+}
+
+// Map-Action Pipeline: AI-driven map commands
+interface MapCommand {
+    action: 'HIGHLIGHT_PATH' | 'ZOOM_TO' | 'ADD_MARKER' | 'FOCUS_AND_HIGHLIGHT' | 'SHOW_HEATMAP' | 'CLEAR_OVERLAYS';
+    target_bus_id?: string;
+    target_stop_id?: string;
+    coordinates?: { lat: number; lng: number };
+    geoJSON?: unknown;
+    reasoning_color?: string;
+    message?: string;
+    zoom_level?: number;
+}
+
+// Route map tool data - AI invokes this when visualization helps
+interface RouteMapToolData {
+    vehicleName: string;
+    vehicleId: string;
+    stopsToMark: MapStopCoordinate[];
+    // Route polyline - ordered coordinates for drawing the bus route
+    routePolyline: { lat: number; lng: number }[];
+    userLocation?: { lat: number; lng: number };
+    busLocation?: MapBusLocation;
+    walkingPath?: { lat: number; lng: number }[];
+    walkingDistanceM?: number;
+    walkingTimeMin?: number;
+    mapBounds: MapBounds;
+    etaMinutes: number;
+    distanceKm: number;
+    // Include GeoJSON for advanced rendering
+    geoJSON?: any;
+}
+
+// Agent tool call structure
+interface AgentToolCall {
+    tool: 'show_route_map' | 'show_bus_location' | 'show_nearby_stops';
+    data: RouteMapToolData | Record<string, unknown>;
 }
 
 // Agent output
+
 interface AgentOutput {
     success: boolean;
     agentName: string;
@@ -281,6 +488,9 @@ interface PipelineContext {
     // Agent Communication Hub for inter-agent messaging
     hub: IAgentCommunicationHub;
 
+    // Streaming callback for real-time reasoning display
+    streamReasoning?: (text: string) => Promise<void>;
+
     // Layer outputs
     intent?: AnalyzedIntent;
     filteredStops?: FilteredStop[];
@@ -288,6 +498,13 @@ interface PipelineContext {
     filteredBuses?: FilteredBus[];
     bestRoute?: RouteResult;
     alternatives?: RouteResult[];
+
+    // ============================================
+    // PARALLEL ROUTE DISCOVERY OUTPUTS
+    // ============================================
+    allRoutes?: RouteResult[];        // ALL matching direct routes
+    topRoutes?: RouteResult[];        // Top 3 recommendations
+    multiHopRoutes?: MultiHopRoute[]; // Routes with transfers
 
     // Walking directions to nearest stop
     walkingDirections?: {
@@ -307,6 +524,16 @@ interface PipelineContext {
     latestLocations?: LiveLocation[];
     memoryContext?: MemoryContext;
     geocodedPlaces?: Record<string, string>;
+
+    // Map-Action Pipeline: Viewport state for spatial awareness
+    viewportState?: ViewportState;
+    // Map-Action Pipeline: AI-generated map commands
+    mapCommands?: MapCommand[];
+    // Entities visible in viewport (from get-map-entities)
+    visibleEntities?: {
+        buses: Array<{ bus_id: string; vehicle_name: string; latitude: number; longitude: number }>;
+        stops: Array<{ id: string; name: string; latitude: number; longitude: number }>;
+    };
 }
 
 interface MemoryContext {
@@ -457,6 +684,12 @@ INTENTS (in order of priority):
    Keywords: "nearby", "near me", "closest", "around here"
 4. GENERAL - Pure greetings only ("hi", "hello", "help")
 
+SPATIAL GROUNDING (Map-Action Pipeline):
+- If the user says "What is that?", "that bus", "the red one", "this stop" → they are referring to something ON THEIR SCREEN
+- Set "requiresVisualContext": true for queries that need map entity resolution
+- Deictic references like "that", "this", "there", "here", "the one" require viewport context
+- Questions about visible entities: "What route is that?", "Is that bus coming?", "What's at that stop?"
+
 SUBDIVIDING RULES:
 - Extract ALL entities: origin, destination, bus name, preferences
 - Identify sub-intents: shortest_route, alternative_options, fastest, cheapest
@@ -466,7 +699,7 @@ SUBDIVIDING RULES:
 OUTPUT (JSON only):
 {
   "primaryIntent": "FIND_ROUTE" | "TRACK_BUS" | "FIND_NEARBY" | "GENERAL",
-  "subIntents": ["shortest_route", "alternative_options"],
+  "subIntents": ["shortest_route", "alternative_options", "show_map"],
   "entities": {
     "origin": "extracted origin or null",
     "destination": "extracted destination or null",
@@ -474,8 +707,11 @@ OUTPUT (JSON only):
     "preferences": ["fastest", "shortest"]
   },
   "confidence": 0.0-1.0,
-  "reasoning": "brief explanation"
-}`;
+  "reasoning": "brief explanation",
+  "showMap": boolean, // Set to true if query implies a visual need like "show", "map", "locate", "where"
+  "requiresVisualContext": boolean // Set to true if query references visible map entities ("that", "this", etc.)
+} Setting showMap to true is CRITICAL for map-worthy queries.
+`;
 
 // Fallback patterns for deterministic intent analysis
 const INTENT_PATTERNS = [
@@ -489,38 +725,46 @@ const INTENT_PATTERNS = [
 ];
 
 async function analyzeIntentWithAI(query: string): Promise<AnalyzedIntent> {
-    const apiKey = Deno.env.get('GROQ_API_KEY');
+    const apiKey = Deno.env.get('OPENROUTER_API_KEY');
 
     // ========================================
-    // PHASE 3: Tiered Intent Analysis
-    // 1. Try LLM first if available
+    // PHASE 3: Tiered Intent Analysis with OpenRouter
+    // 1. Try LLM first if available (with reasoning)
     // 2. Fall back to patterns
     // 3. Retry with LLM if pattern confidence is LOW
     // ========================================
 
     if (apiKey) {
         try {
-            const response = await fetch(GROQ_API_URL, {
+            const response = await fetch(OPENROUTER_API_URL, {
                 method: 'POST',
                 headers: {
                     'Authorization': `Bearer ${apiKey}`,
-                    'Content-Type': 'application/json'
+                    'Content-Type': 'application/json',
+                    ...OPENROUTER_HEADERS
                 },
                 body: JSON.stringify({
-                    model: GROQ_MODEL_FAST,
+                    model: OPENROUTER_MODEL,
                     messages: [
                         { role: 'system', content: INTENT_ANALYSIS_PROMPT },
                         { role: 'user', content: `Query: "${query}"` }
                     ],
                     temperature: 0.1,
                     max_tokens: 300,
-                    response_format: { type: 'json_object' }
+                    reasoning: { enabled: true }
                 })
             });
 
             if (response.ok) {
                 const data = await response.json();
-                const content = data.choices[0]?.message?.content || '';
+                const message = data.choices[0]?.message;
+                const content = message?.content || '';
+
+                // Log reasoning if available
+                if (message?.reasoning_details) {
+                    console.log('[Layer1] AI reasoning:', message.reasoning_details.length, 'steps');
+                }
+
                 const parsed = JSON.parse(content);
 
                 const result: AnalyzedIntent = {
@@ -530,6 +774,11 @@ async function analyzeIntentWithAI(query: string): Promise<AnalyzedIntent> {
                     confidence: parsed.confidence || 0.7,
                     reasoning: `[AI] ${parsed.reasoning || ''}`
                 };
+
+                // Store map trigger decision in subIntents for simple propagation
+                if (parsed.showMap === true && !result.subIntents.includes('show_map')) {
+                    result.subIntents.push('show_map');
+                }
 
                 // Log confidence tier
                 const tier = getConfidenceTier(result.confidence);
@@ -559,21 +808,22 @@ async function analyzeIntentWithAI(query: string): Promise<AnalyzedIntent> {
         console.log(`[Layer1] ${retryDecision.reason} - retrying with LLM`);
         try {
             // Retry with more explicit prompt for ambiguous queries
-            const retryResponse = await fetch(GROQ_API_URL, {
+            const retryResponse = await fetch(OPENROUTER_API_URL, {
                 method: 'POST',
                 headers: {
                     'Authorization': `Bearer ${apiKey}`,
-                    'Content-Type': 'application/json'
+                    'Content-Type': 'application/json',
+                    ...OPENROUTER_HEADERS
                 },
                 body: JSON.stringify({
-                    model: GROQ_MODEL_FAST,
+                    model: OPENROUTER_MODEL,
                     messages: [
                         { role: 'system', content: INTENT_ANALYSIS_PROMPT + '\n\nNote: This is a retry for an ambiguous query. Be more careful with entity extraction.' },
                         { role: 'user', content: `Query: "${query}"` }
                     ],
                     temperature: 0.2,
                     max_tokens: 400,
-                    response_format: { type: 'json_object' }
+                    reasoning: { enabled: true }
                 })
             });
 
@@ -636,9 +886,15 @@ function analyzeIntentWithPatterns(query: string): AnalyzedIntent {
             // Higher confidence for specific patterns
             const confidence = priority >= 8 ? 0.85 : priority >= 5 ? 0.7 : 0.55;
 
+            // Trigger map for most patterns automatically
+            const subIntents = /alternative|other|different/i.test(q) ? ['alternative_options'] : [];
+            if (/show|map|where|track|locate|find/i.test(q)) {
+                subIntents.push('show_map');
+            }
+
             return {
                 primaryIntent: intent,
-                subIntents: /alternative|other|different/i.test(q) ? ['alternative_options'] : [],
+                subIntents,
                 entities,
                 confidence,
                 reasoning: `[Pattern] Priority ${priority} match`
@@ -825,30 +1081,46 @@ function filterBusesByStops(
 // LAYER 5: AI RESPONSE (Grounded, No Hallucination)
 // ============================================================================
 
-const GROUNDED_RESPONSE_PROMPT = `You are Sahara - a friendly, conversational bus travel assistant
+const GROUNDED_RESPONSE_PROMPT = `You are **Sahara** - a friendly, conversational bus travel assistant.
 
-YOUR PERSONALITY:
-- Speak naturally like a helpful local friend
-- Be warm but concise - answer in 4-5 sentences with key bullet points
-- Sound confident when data is fresh, cautious when data is stale
+## YOUR PERSONA
+- Warm and patient - like a helpful local friend who knows the bus system
+- Conversational but focused on helping the user travel
+- Reassuring about timing, walking distances, and connections
 
-CRITICAL GROUNDING RULES:
-1. ONLY use information from the PROVIDED DATA - never invent anything
-2. If the data shows something, state it as fact
-3. If data is missing or stale, honestly say so
-4. Adapt your tone based on data freshness (LIVE=confident, STALE=cautious)
-5. CONFIDENCE ENFORCEMENT: If confidence < 60%, explicitly say "this may not be exact" or "I'm not fully certain"
+## ABSOLUTE GROUNDING RULES (CRITICAL - NEVER VIOLATE)
+1. **ONLY speak from PROVIDED DATA** - NEVER invent routes, buses, stops, or times
+2. **If no route exists in the data, say so clearly** - "I don't have a direct route for that in my database"
+3. **Do NOT hallucinate or assume** - if information is missing, honestly say "I don't have that information"
+4. **Present ONLY what is available** - every bus name, stop, and time must come from the data below
+5. **When data is stale or uncertain, say so** - "This data is about X minutes old"
 
-RESPONSE STRUCTURE:
-Start with a brief friendly summary, then list:
-• Key fact 1 (bus name, route, ETA)
-• Key fact 2 (walk time, stops away)
-• Optional: Alternative if available
+## RESPONSE STRUCTURE
+Start with a warm acknowledgment, then present routes:
 
-USE THESE INDICATORS:
-🚌 = bus route/name | 📍 = location/stop | ⏱️ = time/ETA | 🚶 = walking | 🟢 = live/active | 🔴 = stopped/offline
+**🎯 Top Recommendations** (if routes found):
+1️⃣ **[Bus Name]** - [Why it's good: fastest/fewest stops/live tracking]
+   📍 [Origin] → [Destination] | ⏱️ ~[ETA] min | 🚌 [Live/Offline status]
 
-Be helpful, be honest, be brief.`;
+2️⃣ **[Bus Name]** (if available)
+   📍 [Origin] → [Destination] | ⏱️ ~[ETA] min
+
+3️⃣ **[Bus A → Bus B]** (if transfer route available)
+   📍 [Origin] → [Transfer] → [Destination] | ⏱️ ~[Total] min
+
+**📋 All Available Options:**
+List any additional routes briefly.
+
+## WHEN NO ROUTES FOUND
+- Say clearly: "I don't have a route between [A] and [B] in my database."
+- Do NOT make up alternatives
+- Can suggest checking nearby stops IF they are in the data
+
+## INDICATORS
+🚌 = bus | 📍 = stop | ⏱️ = time | 🚶 = walk | 🟢 = live | 🔴 = offline
+
+Remember: If it's NOT in the PROVIDED DATA below, you CANNOT mention it.`;
+
 
 async function generateGroundedResponse(
     query: string,
@@ -857,28 +1129,58 @@ async function generateGroundedResponse(
     // Build grounded context from pipeline data
     const groundedData: string[] = ['=== PROVIDED DATA (Use ONLY this) ==='];
 
-    // Best route - only include for FIND_ROUTE intent
-    if (ctx.bestRoute && ctx.intent?.primaryIntent === 'FIND_ROUTE') {
-        groundedData.push(`\nBEST ROUTE FOUND:`);
-        groundedData.push(`  Bus: "${ctx.bestRoute.vehicleName}" (${ctx.bestRoute.vehicleNumber})`);
-        groundedData.push(`  Path: ${ctx.bestRoute.originStop} → ${ctx.bestRoute.destinationStop}`);
-        groundedData.push(`  Distance: ${ctx.bestRoute.distanceKm} km`);
-        groundedData.push(`  ETA: ${ctx.bestRoute.etaMinutes} minutes`);
-        groundedData.push(`  Data Freshness: ${ctx.bestRoute.isLive ? 'LIVE' : 'STALE'}`);
-        groundedData.push(`  Stops: ${ctx.bestRoute.stopsInPath.join(' → ')}`);
-        if (ctx.bestRoute.walkTimeMinutes) {
-            groundedData.push(`  Walk to stop: ${ctx.bestRoute.walkDistanceMeters}m (${ctx.bestRoute.walkTimeMinutes} min)`);
+    // ========================================
+    // ROUTE DATA - All matching routes for FIND_ROUTE intent
+    // ========================================
+    if (ctx.intent?.primaryIntent === 'FIND_ROUTE') {
+        // Top 3 Recommendations
+        if (ctx.topRoutes && ctx.topRoutes.length > 0) {
+            groundedData.push(`\n🎯 TOP 3 RECOMMENDED ROUTES:`);
+            ctx.topRoutes.forEach((route, i) => {
+                groundedData.push(`\n  ${i + 1}. "${route.vehicleName}" (${route.vehicleNumber})`);
+                groundedData.push(`     Path: ${route.originStop} → ${route.destinationStop}`);
+                groundedData.push(`     ETA: ${route.etaMinutes} min | Distance: ${route.distanceKm} km | Stops: ${route.stopsInPath.length}`);
+                groundedData.push(`     Status: ${route.isLive ? 'LIVE TRACKING' : 'Scheduled'}`);
+                if (route.isLive && route.busStopsAway !== undefined) {
+                    groundedData.push(`     Bus Position: ${route.busStopsAway} stops away from pickup`);
+                }
+                if (route.walkTimeMinutes) {
+                    groundedData.push(`     Walk to stop: ${route.walkDistanceMeters}m (${route.walkTimeMinutes} min)`);
+                }
+            });
         }
-        if (ctx.bestRoute.isLive && ctx.bestRoute.busStopsAway !== undefined) {
-            groundedData.push(`  Bus is ${ctx.bestRoute.busStopsAway} stops away from pickup`);
-        }
-    }
 
-    // Alternatives - only include for FIND_ROUTE intent
-    if (ctx.alternatives && ctx.alternatives.length > 0 && ctx.intent?.primaryIntent === 'FIND_ROUTE') {
-        groundedData.push(`\nALTERNATIVES:`);
-        for (const alt of ctx.alternatives.slice(0, 2)) {
-            groundedData.push(`  - ${alt.vehicleName}: ${alt.etaMinutes} min, ${alt.distanceKm} km`);
+        // All other direct routes
+        if (ctx.allRoutes && ctx.allRoutes.length > 3) {
+            groundedData.push(`\n📋 ALL AVAILABLE DIRECT ROUTES (${ctx.allRoutes.length} total):`);
+            ctx.allRoutes.slice(3).forEach(route => {
+                groundedData.push(`  - ${route.vehicleName}: ${route.originStop} → ${route.destinationStop}, ${route.etaMinutes} min, ${route.distanceKm} km ${route.isLive ? '🟢' : ''}`);
+            });
+        }
+
+        // Multi-hop transfer routes
+        if (ctx.multiHopRoutes && ctx.multiHopRoutes.length > 0) {
+            groundedData.push(`\n🔄 TRANSFER ROUTES (with 1 connection):`);
+            ctx.multiHopRoutes.forEach((route, i) => {
+                groundedData.push(`  ${i + 1}. ${route.summary}`);
+                groundedData.push(`     Total: ${route.totalEtaMinutes} min | ${route.totalDistanceKm} km`);
+                route.legs.forEach(leg => {
+                    if (leg.type === 'bus') {
+                        groundedData.push(`     🚌 ${leg.vehicleName}: ${leg.originStop} → ${leg.destinationStop} (${leg.etaMinutes} min)`);
+                    } else {
+                        groundedData.push(`     🚶 Walk: ${leg.originStop} → ${leg.destinationStop} (${leg.etaMinutes} min)`);
+                    }
+                });
+            });
+        }
+
+        // Summary stats
+        const totalDirectRoutes = ctx.allRoutes?.length || 0;
+        const totalTransferRoutes = ctx.multiHopRoutes?.length || 0;
+        if (totalDirectRoutes === 0 && totalTransferRoutes === 0) {
+            groundedData.push(`\n⚠️ NO ROUTES FOUND in database for this journey.`);
+        } else {
+            groundedData.push(`\n📊 SUMMARY: ${totalDirectRoutes} direct routes, ${totalTransferRoutes} transfer routes found`);
         }
     }
 
@@ -951,59 +1253,77 @@ async function generateGroundedResponse(
     groundedData.push(`\nUser Query: "${query}"`);
     groundedData.push('\nGenerate a helpful, natural response using ONLY the data above. Be conversational but concise. Use bullet points for key facts.');
 
-    // Try Groq first (faster), then Gemini as fallback
-    const groqKey = Deno.env.get('GROQ_API_KEY');
-    const geminiKey = Deno.env.get('GEMINI_API_KEY');
+    // Layer 5: AI Response Generation using OpenRouter exclusively
+    const openRouterKey = Deno.env.get('OPENROUTER_API_KEY');
 
-    if (groqKey) {
+    if (openRouterKey) {
         try {
-            const response = await fetch(GROQ_API_URL, {
+            const response = await fetch(OPENROUTER_API_URL, {
                 method: 'POST',
                 headers: {
-                    'Authorization': `Bearer ${groqKey}`,
-                    'Content-Type': 'application/json'
+                    'Authorization': `Bearer ${openRouterKey}`,
+                    'Content-Type': 'application/json',
+                    ...OPENROUTER_HEADERS
                 },
                 body: JSON.stringify({
-                    model: GROQ_MODEL_QUALITY,
+                    model: OPENROUTER_MODEL,
                     messages: [
                         { role: 'system', content: GROUNDED_RESPONSE_PROMPT },
                         { role: 'user', content: groundedData.join('\n') }
                     ],
                     temperature: 0.2,
-                    max_tokens: 500
+                    max_tokens: 500,
+                    reasoning: { enabled: true }
                 })
             });
 
             if (response.ok) {
                 const data = await response.json();
-                return data.choices[0]?.message?.content?.trim() || generateFallbackResponse(ctx);
+                const message = data.choices[0]?.message;
+
+                console.log('[Layer5] OpenRouter response status:', response.status);
+                console.log('[Layer5] OpenRouter message keys:', message ? Object.keys(message) : 'no message');
+
+                // Stream reasoning details in real-time if callback is available
+                if (message?.reasoning_details && Array.isArray(message.reasoning_details)) {
+                    console.log('[Layer5] OpenRouter reasoning:', message.reasoning_details.length, 'steps');
+
+                    // Stream each reasoning step immediately to the client
+                    for (const detail of message.reasoning_details) {
+                        const reasoningText = detail.text || detail.content || '';
+                        if (reasoningText && reasoningText.length > 5) {
+                            // Extract readable portion
+                            const shortText = reasoningText.split('.')[0].trim();
+                            if (shortText.length > 5 && shortText.length < 200) {
+                                console.log('[Layer5] Streaming reasoning:', shortText.substring(0, 100));
+                                if (ctx.streamReasoning) {
+                                    await ctx.streamReasoning(shortText + '...');
+                                }
+                            } else if (reasoningText.length < 200) {
+                                console.log('[Layer5] Streaming reasoning:', reasoningText.substring(0, 100));
+                                if (ctx.streamReasoning) {
+                                    await ctx.streamReasoning(reasoningText);
+                                }
+                            }
+                        }
+                    }
+
+                    // Also store for final response
+                    (ctx as unknown as { reasoningDetails: OpenRouterReasoningDetail[] }).reasoningDetails = message.reasoning_details;
+                } else {
+                    console.log('[Layer5] No reasoning_details in response');
+                }
+
+                return message?.content?.trim() || generateFallbackResponse(ctx);
+            } else {
+                const errorText = await response.text();
+                console.error('[Layer5] OpenRouter error:', response.status, errorText.substring(0, 500));
             }
         } catch (e) {
-            console.warn('[Layer5] Groq failed:', e);
+            console.warn('[Layer5] OpenRouter failed, using fallback:', e);
         }
-    }
-
-    if (geminiKey) {
-        try {
-            const response = await fetch(`${GEMINI_API_URL}/${GEMINI_MODEL}:generateContent`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'x-goog-api-key': geminiKey
-                },
-                body: JSON.stringify({
-                    contents: [{ parts: [{ text: `${GROUNDED_RESPONSE_PROMPT}\n\n${groundedData.join('\n')}` }], role: 'user' }],
-                    generationConfig: { temperature: 0.3, maxOutputTokens: 500 }
-                })
-            });
-
-            if (response.ok) {
-                const data = await response.json();
-                return data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || generateFallbackResponse(ctx);
-            }
-        } catch (e) {
-            console.warn('[Layer5] Gemini failed:', e);
-        }
+    } else {
+        console.warn('[Layer5] No OPENROUTER_API_KEY configured, using fallback');
     }
 
     return generateFallbackResponse(ctx);
@@ -1035,12 +1355,228 @@ function generateFallbackResponse(ctx: PipelineContext): string {
         }
         return msg;
     }
-
     return 'I could not find the information you requested. Please try again with more details.';
 }
 
 // ============================================================================
-// DATA AGENT - Optimized with Caching \u0026 RPC (30-40s freshness)
+// AGENTIC MAP TOOL BUILDER (Delegates to get-map-data Edge Function)
+// ============================================================================
+
+/**
+ * Build map tool call by delegating to the dedicated get-map-data Edge Function.
+ * This is the MCP-style approach: process-query orchestrates, get-map-data executes.
+ * 
+ * Returns null if no visualization is needed.
+ */
+async function buildMapToolCall(ctx: PipelineContext): Promise<AgentToolCall | null> {
+    const intent = ctx.intent?.primaryIntent;
+
+    // Only show map for route/tracking/nearby intents
+    if (!intent || intent === 'GENERAL') {
+        return null;
+    }
+
+    // Check if map is explicitly or implicitly requested
+    const isMapRequested = ctx.intent?.subIntents.includes('show_map') ||
+        ctx.bestRoute ||
+        (ctx.filteredBuses && ctx.filteredBuses.length > 0) ||
+        (intent === 'FIND_NEARBY' && ctx.nearestStops && ctx.nearestStops.length > 0);
+
+    if (!isMapRequested) {
+        return null;
+    }
+
+    try {
+        const supabaseUrl = Deno.env.get('SUPABASE_URL');
+        const serviceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY');
+
+        if (!supabaseUrl || !serviceKey) {
+            console.warn('[MapTool] Missing Supabase config, falling back to inline logic');
+            return buildMapToolCallFallback(ctx);
+        }
+
+        // Determine vehicle ID(s) to pass
+        const vehicleIds: string[] = [];
+        if (ctx.bestRoute?.vehicleId) {
+            vehicleIds.push(ctx.bestRoute.vehicleId);
+        }
+        if (ctx.filteredBuses && ctx.filteredBuses.length > 0) {
+            for (const bus of ctx.filteredBuses) {
+                if (!vehicleIds.includes(bus.vehicle.id)) {
+                    vehicleIds.push(bus.vehicle.id);
+                }
+            }
+        }
+        if (ctx.nearestStops && ctx.nearestStops.length > 0) {
+            for (const ns of ctx.nearestStops) {
+                if (!vehicleIds.includes(ns.vehicleId)) {
+                    vehicleIds.push(ns.vehicleId);
+                }
+            }
+        }
+
+        // Build request for get-map-data
+        const mapRequest = {
+            vehicleIds: vehicleIds.length > 0 ? vehicleIds : undefined,
+            userLocation: ctx.userLocation ? {
+                lat: ctx.userLocation.latitude,
+                lng: ctx.userLocation.longitude
+            } : undefined,
+            busLocation: ctx.filteredBuses?.[0]?.latestLocation ? {
+                lat: ctx.filteredBuses[0].latestLocation.latitude,
+                lng: ctx.filteredBuses[0].latestLocation.longitude,
+                heading: ctx.filteredBuses[0].latestLocation.heading || undefined
+            } : undefined,
+            intent,
+            origin: ctx.intent?.entities?.origin,
+            destination: ctx.intent?.entities?.destination
+        };
+
+        console.log('[MapTool] Calling get-map-data with', vehicleIds.length, 'vehicles');
+
+        const response = await fetch(`${supabaseUrl}/functions/v1/get-map-data`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'apikey': serviceKey,
+                'Authorization': `Bearer ${serviceKey}`
+            },
+            body: JSON.stringify(mapRequest)
+        });
+
+        if (!response.ok) {
+            console.error('[MapTool] get-map-data failed:', response.status);
+            return buildMapToolCallFallback(ctx);
+        }
+
+        const mapPayload = await response.json();
+        console.log('[MapTool] get-map-data returned:', mapPayload.mapType, 'with', mapPayload.stops?.length, 'stops');
+
+        // Determine tool name based on map type
+        let toolName: 'show_route_map' | 'show_bus_location' | 'show_nearby_stops' = 'show_route_map';
+        if (mapPayload.mapType === 'tracking') {
+            toolName = 'show_bus_location';
+        } else if (mapPayload.mapType === 'nearby') {
+            toolName = 'show_nearby_stops';
+        }
+
+        // Transform MapPayload to RouteMapToolData format for compatibility
+        const toolData: RouteMapToolData = {
+            vehicleName: mapPayload.vehicleInfo?.name || 'Bus',
+            vehicleId: mapPayload.vehicleInfo?.number || '',
+            stopsToMark: (mapPayload.stops || []).map((s: any) => ({
+                name: s.name,
+                lat: s.lat,
+                lng: s.lng,
+                order: s.order,
+                isOrigin: s.isOrigin,
+                isDestination: s.isDestination
+            })),
+            routePolyline: mapPayload.polyline || [],
+            userLocation: mapPayload.userLocation,
+            busLocation: mapPayload.busLocation ? {
+                lat: mapPayload.busLocation.lat,
+                lng: mapPayload.busLocation.lng,
+                heading: mapPayload.busLocation.heading,
+                isMoving: true
+            } : undefined,
+            mapBounds: mapPayload.bounds,
+            etaMinutes: 0,
+            distanceKm: 0,
+            // Include GeoJSON for advanced rendering
+            geoJSON: mapPayload.geoJSON
+        };
+
+        return { tool: toolName, data: toolData };
+
+    } catch (error) {
+        console.error('[MapTool] Error calling get-map-data:', error);
+        return buildMapToolCallFallback(ctx);
+    }
+}
+
+/**
+ * Fallback: Build map tool call inline if get-map-data Edge Function is unavailable.
+ * This preserves backward compatibility.
+ */
+function buildMapToolCallFallback(ctx: PipelineContext): AgentToolCall | null {
+    const intent = ctx.intent?.primaryIntent;
+
+    // FIND_ROUTE fallback
+    if (intent === 'FIND_ROUTE' && ctx.nearestStops && ctx.nearestStops.length > 0) {
+        const stops = ctx.nearestStops;
+        const vehicleId = stops[0]?.vehicleId || '';
+        const vehicleName = stops[0]?.vehicleName || 'Bus';
+
+        const vehicleStops = (ctx.allStops || [])
+            .filter(s => s.vehicle_id === vehicleId)
+            .sort((a, b) => a.stop_order - b.stop_order);
+
+        if (vehicleStops.length === 0) return null;
+
+        const stopsToMark: MapStopCoordinate[] = vehicleStops.map(s => ({
+            name: s.name,
+            lat: s.latitude,
+            lng: s.longitude,
+            order: s.stop_order
+        }));
+
+        const routePolyline = stopsToMark.map(s => ({ lat: s.lat, lng: s.lng }));
+
+        const allLats = stopsToMark.map(s => s.lat);
+        const allLngs = stopsToMark.map(s => s.lng);
+        if (ctx.userLocation) {
+            allLats.push(ctx.userLocation.latitude);
+            allLngs.push(ctx.userLocation.longitude);
+        }
+
+        return {
+            tool: 'show_route_map',
+            data: {
+                vehicleName,
+                vehicleId,
+                stopsToMark,
+                routePolyline,
+                userLocation: ctx.userLocation ? { lat: ctx.userLocation.latitude, lng: ctx.userLocation.longitude } : undefined,
+                mapBounds: {
+                    north: Math.max(...allLats) + 0.002,
+                    south: Math.min(...allLats) - 0.002,
+                    east: Math.max(...allLngs) + 0.002,
+                    west: Math.min(...allLngs) - 0.002
+                },
+                etaMinutes: 0,
+                distanceKm: 0
+            }
+        };
+    }
+
+    // User location only fallback
+    if (ctx.userLocation) {
+        return {
+            tool: 'show_nearby_stops',
+            data: {
+                vehicleName: 'Your Location',
+                vehicleId: '',
+                stopsToMark: [],
+                routePolyline: [],
+                userLocation: { lat: ctx.userLocation.latitude, lng: ctx.userLocation.longitude },
+                mapBounds: {
+                    north: ctx.userLocation.latitude + 0.01,
+                    south: ctx.userLocation.latitude - 0.01,
+                    east: ctx.userLocation.longitude + 0.01,
+                    west: ctx.userLocation.longitude - 0.01
+                },
+                etaMinutes: 0,
+                distanceKm: 0
+            }
+        };
+    }
+
+    return null;
+}
+
+// ============================================================================
+// DATA AGENT - Optimized with Caching & RPC (30-40s freshness)
 // ============================================================================
 
 // Simple in-memory cache using Map
@@ -1119,7 +1655,11 @@ async function fetchLatestData(ctx: PipelineContext): Promise<AgentOutput> {
             const allLocs = (fallbackLoc.data || []) as LiveLocation[];
             ctx.latestLocations = Array.from(getLatestBusLocations(allLocs).values());
         } else {
-            ctx.latestLocations = (locationsData || []) as LiveLocation[];
+            // Map location_ts to timestamp for consistent code usage
+            ctx.latestLocations = (locationsData || []).map((l: any) => ({
+                ...l,
+                timestamp: l.location_ts || l.timestamp
+            })) as LiveLocation[];
         }
 
         console.log('[DataAgent] Latest locations (40s freshness):', ctx.latestLocations.length);
@@ -1300,9 +1840,18 @@ async function findRoutes(ctx: PipelineContext): Promise<AgentOutput> {
     const matchedRoutes: RouteResult[] = [];
 
     for (const vehicle of ctx.vehicles) {
-        const vehicleStops = ctx.allStops
-            .filter(s => s.vehicle_id === vehicle.id)
-            .sort((a, b) => a.stop_order - b.stop_order);
+        // Fetch ordered stops for this specific vehicle from the new backend endpoint
+        const routeResult = await callGetRouteStops([vehicle.id]);
+        const vehicleStops: RouteStop[] = (routeResult?.success && routeResult.routes[vehicle.id])
+            ? routeResult.routes[vehicle.id]
+            : ctx.allStops
+                .filter(s => s.vehicle_id === vehicle.id)
+                .sort((a, b) => a.stop_order - b.stop_order);
+
+        // Update context cache for the map tool
+        if (routeResult?.success) {
+            ctx.allStops = [...(ctx.allStops || []), ...vehicleStops];
+        }
 
         // Find origin and destination stops on this route
         const originStop = destination
@@ -1402,6 +1951,56 @@ async function findRoutes(ctx: PipelineContext): Promise<AgentOutput> {
         };
     }
 
+    // Mark all as direct routes
+    matchedRoutes.forEach(r => { (r as RouteResult).isDirectRoute = true; });
+
+    // Store ALL routes and top 3 for conversational response
+    ctx.allRoutes = matchedRoutes;
+    ctx.topRoutes = matchedRoutes.slice(0, 3);
+
+    // ========================================
+    // AI-ENHANCED ROUTE RANKING
+    // Ask AI to rank routes considering: live status, ETA, user preferences
+    // ========================================
+    if (matchedRoutes.length > 1) {
+        interface RouteRankingResult {
+            rankings: Array<{ vehicleId: string; rank: number; reason: string }>;
+        }
+
+        const routeSummary = matchedRoutes.slice(0, 5).map((r, i) =>
+            `${i + 1}. ${r.vehicleName}: ${r.originStop}→${r.destinationStop}, ETA ${r.etaMinutes}min, ${r.isLive ? 'LIVE' : 'offline'}, walk ${r.walkTimeMinutes || '?'}min`
+        ).join('\n');
+
+        const aiRanking = await callAgentAI<RouteRankingResult>(
+            'RouteRankingAgent',
+            `You are a route ranking expert. Rank bus routes for a user. Consider:
+1. LIVE tracking is better than offline (more reliable ETA)
+2. Shorter ETA is better
+3. Shorter walking distance is better
+Return JSON: { "rankings": [{ "vehicleId": "id", "rank": 1-5, "reason": "brief reason" }] }`,
+            `Routes to rank:\n${routeSummary}\nUser wants: ${destination || 'destination'}`
+        );
+
+        if (aiRanking.success && aiRanking.result?.rankings) {
+            console.log('[RouteAgent] AI ranking applied');
+            // Re-order top routes based on AI ranking
+            const aiRankMap = new Map(aiRanking.result.rankings.map(r => [r.vehicleId, r]));
+            matchedRoutes.sort((a, b) => {
+                const aRank = aiRankMap.get(a.vehicleId)?.rank ?? 99;
+                const bRank = aiRankMap.get(b.vehicleId)?.rank ?? 99;
+                return aRank - bRank;
+            });
+            ctx.topRoutes = matchedRoutes.slice(0, 3);
+            // Store AI reasoning
+            ctx.topRoutes.forEach(route => {
+                const aiInfo = aiRankMap.get(route.vehicleId);
+                if (aiInfo) {
+                    (route as RouteResult & { aiReason?: string }).aiReason = aiInfo.reason;
+                }
+            });
+        }
+    }
+
     ctx.bestRoute = matchedRoutes[0];
     ctx.alternatives = matchedRoutes.slice(1, 3);
 
@@ -1427,6 +2026,197 @@ async function findRoutes(ctx: PipelineContext): Promise<AgentOutput> {
         },
         message: `Found ${matchedRoutes.length} routes (${liveRoutesCount} live), best: ${ctx.bestRoute.vehicleName} (${ctx.bestRoute.etaMinutes} min)`,
         confidence: dynamicConfidence,
+        executionTimeMs: Date.now() - startTime
+    };
+}
+
+// ============================================================================
+// MULTI-HOP ROUTE AGENT - Find routes with one transfer
+// ============================================================================
+
+/**
+ * Find routes that require one transfer (Bus A → Walk → Bus B)
+ * This agent runs in PARALLEL with findRoutes() for comprehensive coverage
+ */
+async function findMultiHopRoutes(ctx: PipelineContext): Promise<AgentOutput> {
+    const startTime = Date.now();
+
+    // Only for FIND_ROUTE intent
+    if (ctx.intent?.primaryIntent !== 'FIND_ROUTE') {
+        return {
+            success: true,
+            agentName: 'MultiHopRouteAgent',
+            data: { searched: false },
+            message: 'Not a route-finding query',
+            confidence: 1.0,
+            executionTimeMs: Date.now() - startTime
+        };
+    }
+
+    const origin = ctx.intent.entities.origin;
+    const destination = ctx.intent.entities.destination;
+
+    if (!ctx.vehicles || !ctx.allStops || !origin || !destination) {
+        return {
+            success: false,
+            agentName: 'MultiHopRouteAgent',
+            data: {},
+            error: 'Missing required data for multi-hop search',
+            confidence: 0,
+            executionTimeMs: Date.now() - startTime
+        };
+    }
+
+    const multiHopRoutes: MultiHopRoute[] = [];
+    const latestLocations = getLatestBusLocations(ctx.latestLocations || []);
+
+    // Find all stops that could be origin or destination matches
+    const originStops = ctx.allStops.filter(s =>
+        s.name.toLowerCase().includes(origin.toLowerCase())
+    );
+    const destStops = ctx.allStops.filter(s =>
+        s.name.toLowerCase().includes(destination.toLowerCase())
+    );
+
+    // For each origin bus route, find transfer points to destination bus routes
+    const processedPairs = new Set<string>();
+
+    for (const oStop of originStops) {
+        for (const dStop of destStops) {
+            // Skip if same vehicle (that's a direct route, handled by findRoutes)
+            if (oStop.vehicle_id === dStop.vehicle_id) continue;
+
+            const pairKey = `${oStop.vehicle_id}-${dStop.vehicle_id}`;
+            if (processedPairs.has(pairKey)) continue;
+            processedPairs.add(pairKey);
+
+            // Find transfer points: stops served by BOTH routes
+            const route1Stops = ctx.allStops.filter(s => s.vehicle_id === oStop.vehicle_id);
+            const route2Stops = ctx.allStops.filter(s => s.vehicle_id === dStop.vehicle_id);
+
+            // Find common stop names (transfer points)
+            const route1StopNames = new Set(route1Stops.map(s => s.name.toLowerCase()));
+            const transferStops = route2Stops.filter(s =>
+                route1StopNames.has(s.name.toLowerCase()) &&
+                s.stop_order < dStop.stop_order // Must be before destination
+            );
+
+            for (const transferStop of transferStops) {
+                // Find corresponding stop on route 1
+                const route1Transfer = route1Stops.find(s =>
+                    s.name.toLowerCase() === transferStop.name.toLowerCase() &&
+                    s.stop_order > oStop.stop_order // Must be after origin
+                );
+
+                if (!route1Transfer) continue;
+
+                // Calculate ETAs for each leg
+                const vehicle1 = ctx.vehicles.find(v => v.id === oStop.vehicle_id);
+                const vehicle2 = ctx.vehicles.find(v => v.id === dStop.vehicle_id);
+
+                if (!vehicle1 || !vehicle2) continue;
+
+                // Leg 1: Origin to transfer
+                const leg1Stops = route1Stops.filter(s =>
+                    s.stop_order >= oStop.stop_order && s.stop_order <= route1Transfer.stop_order
+                );
+                let leg1Distance = 0;
+                for (let i = 0; i < leg1Stops.length - 1; i++) {
+                    leg1Distance += haversineDistance(
+                        leg1Stops[i].latitude, leg1Stops[i].longitude,
+                        leg1Stops[i + 1].latitude, leg1Stops[i + 1].longitude
+                    );
+                }
+                const leg1Eta = calculateETA(leg1Distance, leg1Stops.length - 1);
+
+                // Walk time at transfer (average 3 min)
+                const walkTime = 3;
+
+                // Leg 2: Transfer to destination
+                const leg2Stops = route2Stops.filter(s =>
+                    s.stop_order >= transferStop.stop_order && s.stop_order <= dStop.stop_order
+                );
+                let leg2Distance = 0;
+                for (let i = 0; i < leg2Stops.length - 1; i++) {
+                    leg2Distance += haversineDistance(
+                        leg2Stops[i].latitude, leg2Stops[i].longitude,
+                        leg2Stops[i + 1].latitude, leg2Stops[i + 1].longitude
+                    );
+                }
+                const leg2Eta = calculateETA(leg2Distance, leg2Stops.length - 1);
+
+                // Check live status
+                const loc1 = latestLocations.get(vehicle1.id);
+                const loc2 = latestLocations.get(vehicle2.id);
+                const isLeg1Live = !!loc1 && (Date.now() - loc1.timestamp) < 120000;
+                const isLeg2Live = !!loc2 && (Date.now() - loc2.timestamp) < 120000;
+
+                const totalEta = leg1Eta + walkTime + leg2Eta;
+                const totalDistance = Math.round((leg1Distance + leg2Distance) * 10) / 10;
+
+                // Score: penalize transfers, reward live tracking
+                const routeScore = (isLeg1Live ? 30 : 0) + (isLeg2Live ? 30 : 0) +
+                    Math.max(0, 60 - totalEta) - 20; // -20 penalty for transfer
+
+                multiHopRoutes.push({
+                    legs: [
+                        {
+                            type: 'bus',
+                            vehicleId: vehicle1.id,
+                            vehicleName: vehicle1.name,
+                            vehicleNumber: vehicle1.vehicle_number,
+                            originStop: oStop.name,
+                            destinationStop: route1Transfer.name,
+                            etaMinutes: leg1Eta,
+                            distanceKm: Math.round(leg1Distance * 10) / 10,
+                            stopsInPath: leg1Stops.map(s => s.name),
+                            isLive: isLeg1Live
+                        },
+                        {
+                            type: 'walk',
+                            originStop: route1Transfer.name,
+                            destinationStop: transferStop.name,
+                            etaMinutes: walkTime,
+                            distanceKm: 0.2
+                        },
+                        {
+                            type: 'bus',
+                            vehicleId: vehicle2.id,
+                            vehicleName: vehicle2.name,
+                            vehicleNumber: vehicle2.vehicle_number,
+                            originStop: transferStop.name,
+                            destinationStop: dStop.name,
+                            etaMinutes: leg2Eta,
+                            distanceKm: Math.round(leg2Distance * 10) / 10,
+                            stopsInPath: leg2Stops.map(s => s.name),
+                            isLive: isLeg2Live
+                        }
+                    ],
+                    totalEtaMinutes: totalEta,
+                    totalDistanceKm: totalDistance,
+                    transferCount: 1,
+                    routeScore,
+                    summary: `${vehicle1.name} → Walk → ${vehicle2.name}`
+                });
+            }
+        }
+    }
+
+    // Sort by score and limit to top 5
+    multiHopRoutes.sort((a, b) => b.routeScore - a.routeScore);
+    ctx.multiHopRoutes = multiHopRoutes.slice(0, 5);
+
+    return {
+        success: multiHopRoutes.length > 0,
+        agentName: 'MultiHopRouteAgent',
+        data: {
+            multiHopRoutesFound: multiHopRoutes.length,
+            topMultiHop: multiHopRoutes[0]?.summary
+        },
+        message: multiHopRoutes.length > 0
+            ? `Found ${multiHopRoutes.length} transfer routes, best: ${multiHopRoutes[0].summary}`
+            : 'No transfer routes found',
+        confidence: multiHopRoutes.length > 0 ? 0.7 : 0,
         executionTimeMs: Date.now() - startTime
     };
 }
@@ -1490,16 +2280,39 @@ async function trackBus(ctx: PipelineContext): Promise<AgentOutput> {
         };
     }
 
-    // Find nearest stop
-    const vehicleStops = (ctx.allStops || [])
-        .filter(s => s.vehicle_id === vehicle.id)
-        .sort((a, b) => a.stop_order - b.stop_order);
+    // Find ordered stops for this vehicle using the new get-route-stops endpoint
+    // This ensures stops are in their database-defined order for map plotting
+    const routeStopsResult = await callGetRouteStops([vehicle.id]);
+    const vehicleStops: RouteStop[] = (routeStopsResult?.success && routeStopsResult.routes[vehicle.id])
+        ? routeStopsResult.routes[vehicle.id]
+        : (ctx.allStops || []).filter(s => s.vehicle_id === vehicle.id).sort((a, b) => a.stop_order - b.stop_order);
 
+    // Cache the ordered stops back into context for building map commands
+    if (routeStopsResult?.success) {
+        ctx.allStops = [...(ctx.allStops || []), ...vehicleStops];
+    }
+
+    // Find nearest stop to current bus position
     let nearestStop: RouteStop | null = null;
     let minDist = Infinity;
     for (const s of vehicleStops) {
         const d = haversineDistance(latestLocation.latitude, latestLocation.longitude, s.latitude, s.longitude);
         if (d < minDist) { minDist = d; nearestStop = s; }
+    }
+
+    // Populate ctx.filteredBuses for generateMapCommands with complete data
+    if (!ctx.filteredBuses) ctx.filteredBuses = [];
+    const isAlreadyFiltered = ctx.filteredBuses.some(b => b.vehicle.id === vehicle.id);
+    if (!isAlreadyFiltered) {
+        ctx.filteredBuses.push({
+            vehicle,
+            latestLocation,
+            nearestStop: nearestStop || null,
+            stopsAwayFromUser: 0,
+            etaMinutes: 0,
+            isMoving: (latestLocation.speed || 0) > 2,
+            ageSeconds: Math.floor((Date.now() - latestLocation.timestamp) / 1000)
+        });
     }
 
     const ageSeconds = Math.floor((Date.now() - latestLocation.timestamp) / 1000);
@@ -1545,36 +2358,50 @@ async function trackBus(ctx: PipelineContext): Promise<AgentOutput> {
         busEtaMinutes = calculateETA(distanceToCatchStop, stopsAwayFromBus, latestLocation.speed || undefined);
     }
 
-    // Get Mapbox walking directions to catch stop
+    // Get walking directions to catch stop via Edge Function (eliminates MAPBOX_API_URL duplication)
     if (ctx.userLocation && bestCatchStop) {
-        const accessToken = Deno.env.get('MAPBOX_ACCESS_TOKEN');
-        if (accessToken) {
-            try {
-                const coordinates = `${ctx.userLocation.longitude},${ctx.userLocation.latitude};${bestCatchStop.longitude},${bestCatchStop.latitude}`;
-                const mapboxUrl = `${MAPBOX_API_URL}/${coordinates}?access_token=${accessToken}&steps=true&overview=full&geometries=polyline&language=en`;
-                console.log(`[TrackerAgent] Getting walking directions to ${bestCatchStop.name}`);
-                const mapboxResponse = await fetch(mapboxUrl);
-                if (mapboxResponse.ok) {
-                    const mapboxData = await mapboxResponse.json();
-                    if (mapboxData.routes && mapboxData.routes.length > 0) {
-                        const route = mapboxData.routes[0];
-                        const legs = route.legs[0];
-                        const steps = (legs.steps || []).map((step: { maneuver?: { instruction?: string }; distance?: number }) => ({
-                            instruction: step.maneuver?.instruction || 'Continue',
-                            distance: Math.round(step.distance || 0)
-                        }));
+        try {
+            const supabaseUrl = Deno.env.get('SUPABASE_URL');
+            const serviceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY');
+
+            if (supabaseUrl && serviceKey) {
+                console.log(`[TrackerAgent] Getting walking directions to ${bestCatchStop.name} via Edge Function`);
+                const walkingResponse = await fetch(`${supabaseUrl}/functions/v1/get-walking-directions`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'apikey': serviceKey,
+                        'Authorization': `Bearer ${serviceKey}`
+                    },
+                    body: JSON.stringify({
+                        originLat: ctx.userLocation.latitude,
+                        originLng: ctx.userLocation.longitude,
+                        destLat: bestCatchStop.latitude,
+                        destLng: bestCatchStop.longitude,
+                        destStopName: bestCatchStop.name,
+                        language: 'en'
+                    })
+                });
+
+                if (walkingResponse.ok) {
+                    const walkingResult = await walkingResponse.json();
+                    if (walkingResult.success && walkingResult.walkingRoute) {
+                        const route = walkingResult.walkingRoute;
                         ctx.walkingDirections = {
                             destinationStop: bestCatchStop.name,
-                            distanceMeters: Math.round(route.distance),
-                            durationMinutes: Math.ceil(route.duration / 60),
-                            steps,
-                            summary: `${Math.ceil(route.duration / 60)} min walk (${Math.round(route.distance)}m)`
+                            distanceMeters: route.distanceMeters,
+                            durationMinutes: route.durationMinutes,
+                            steps: (route.steps || []).slice(0, 6).map((step: { instruction: string; distance: number }) => ({
+                                instruction: step.instruction,
+                                distance: step.distance
+                            })),
+                            summary: route.summary || `${route.durationMinutes} min walk (${route.distanceMeters}m)`
                         };
                         console.log(`[TrackerAgent] Walking: ${ctx.walkingDirections.summary}`);
                     }
                 }
-            } catch (e) { console.warn('[TrackerAgent] Walking directions failed:', e); }
-        }
+            }
+        } catch (e) { console.warn('[TrackerAgent] Walking directions failed:', e); }
     }
 
     // Store in filtered buses for response generation
@@ -1717,32 +2544,17 @@ async function enrichWithPlaceNames(ctx: PipelineContext): Promise<AgentOutput> 
 }
 
 // ============================================================================
-// WALKING DIRECTIONS AGENT - Mapbox API Integration
+// WALKING DIRECTIONS AGENT - Delegates to get-walking-directions Edge Function
 // ============================================================================
 
-const MAPBOX_API_URL = 'https://api.mapbox.com/directions/v5/mapbox/walking';
-
 /**
- * Get walking directions from Mapbox API to the nearest bus stop
+ * Get walking directions by delegating to the get-walking-directions Edge Function.
+ * This eliminates code duplication - Mapbox API logic is centralized in the Edge Function.
  */
 async function getWalkingDirectionsFromMapbox(ctx: PipelineContext): Promise<AgentOutput> {
     const startTime = Date.now();
 
     try {
-        const accessToken = Deno.env.get('MAPBOX_ACCESS_TOKEN');
-
-        if (!accessToken) {
-            console.warn('[WalkingDirectionsAgent] MAPBOX_ACCESS_TOKEN not configured');
-            return {
-                success: false,
-                agentName: 'WalkingDirectionsAgent',
-                data: {},
-                error: 'Mapbox access token not configured',
-                confidence: 0,
-                executionTimeMs: Date.now() - startTime
-            };
-        }
-
         if (!ctx.userLocation || !ctx.nearestStops || ctx.nearestStops.length === 0) {
             return {
                 success: false,
@@ -1756,78 +2568,84 @@ async function getWalkingDirectionsFromMapbox(ctx: PipelineContext): Promise<Age
 
         // Get the nearest stop
         const nearestStop = ctx.nearestStops[0];
-        const destLat = nearestStop.stop.latitude;
-        const destLng = nearestStop.stop.longitude;
-        const originLat = ctx.userLocation.latitude;
-        const originLng = ctx.userLocation.longitude;
 
-        // Mapbox uses longitude,latitude format
-        const coordinates = `${originLng},${originLat};${destLng},${destLat}`;
-        const url = `${MAPBOX_API_URL}/${coordinates}?` + new URLSearchParams({
-            access_token: accessToken,
-            steps: 'true',
-            overview: 'full',
-            geometries: 'polyline',
-            language: 'en'
+        console.log(`[WalkingDirectionsAgent] Delegating to get-walking-directions Edge Function...`);
+
+        // Call the get-walking-directions Edge Function via HTTP
+        const supabaseUrl = Deno.env.get('SUPABASE_URL');
+        const serviceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY');
+
+        if (!supabaseUrl || !serviceKey) {
+            return {
+                success: false,
+                agentName: 'WalkingDirectionsAgent',
+                data: {},
+                error: 'Missing Supabase configuration for Edge Function call',
+                confidence: 0,
+                executionTimeMs: Date.now() - startTime
+            };
+        }
+
+        const url = `${supabaseUrl}/functions/v1/get-walking-directions`;
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'apikey': serviceKey,
+                'Authorization': `Bearer ${serviceKey}`
+            },
+            body: JSON.stringify({
+                originLat: ctx.userLocation.latitude,
+                originLng: ctx.userLocation.longitude,
+                destLat: nearestStop.stop.latitude,
+                destLng: nearestStop.stop.longitude,
+                destStopName: nearestStop.stop.name,
+                language: 'en'
+            })
         });
-
-        console.log(`[WalkingDirectionsAgent] Calling Mapbox: ${originLat},${originLng} → ${destLat},${destLng}`);
-
-        const response = await fetch(url);
 
         if (!response.ok) {
             const errorText = await response.text();
-            console.error('[WalkingDirectionsAgent] Mapbox API error:', response.status, errorText);
+            console.error('[WalkingDirectionsAgent] Edge Function error:', response.status, errorText);
             return {
                 success: false,
                 agentName: 'WalkingDirectionsAgent',
                 data: {},
-                error: `Mapbox API error: ${response.status}`,
+                error: `Walking directions Edge Function error: ${response.status}`,
                 confidence: 0,
                 executionTimeMs: Date.now() - startTime
             };
         }
 
-        const data = await response.json();
+        const result = await response.json();
 
-        if (!data.routes || data.routes.length === 0) {
+        if (!result.success || !result.walkingRoute) {
             return {
                 success: false,
                 agentName: 'WalkingDirectionsAgent',
                 data: {},
-                error: 'No walking route found',
+                error: result.error || 'No walking route found',
                 confidence: 0,
                 executionTimeMs: Date.now() - startTime
             };
         }
 
-        const route = data.routes[0];
-        const legs = route.legs[0];
-
-        // Extract steps (limit to 6 for LLM safety - long lists don't help conversational responses)
-        const allSteps = (legs.steps || []).map((step: {
-            maneuver?: { instruction?: string };
-            distance?: number;
-        }) => ({
-            instruction: step.maneuver?.instruction || 'Continue',
-            distance: Math.round(step.distance || 0)
+        const walkingRoute = result.walkingRoute;
+        const steps = (walkingRoute.steps || []).slice(0, 6).map((step: { instruction: string; distance: number }) => ({
+            instruction: step.instruction,
+            distance: step.distance
         }));
-        const steps: Array<{ instruction: string; distance: number }> = allSteps.slice(0, 6);
-
-        const durationSeconds = Math.round(route.duration);
-        const durationMinutes = Math.ceil(durationSeconds / 60);
-        const distanceMeters = Math.round(route.distance);
 
         // Store in context
         ctx.walkingDirections = {
             destinationStop: nearestStop.stop.name,
-            distanceMeters,
-            durationMinutes,
+            distanceMeters: walkingRoute.distanceMeters,
+            durationMinutes: walkingRoute.durationMinutes,
             steps,
-            summary: `${durationMinutes} min walk (${distanceMeters}m)`
+            summary: walkingRoute.summary || `${walkingRoute.durationMinutes} min walk (${walkingRoute.distanceMeters}m)`
         };
 
-        console.log(`[WalkingDirectionsAgent] Got directions: ${ctx.walkingDirections.summary}`);
+        console.log(`[WalkingDirectionsAgent] Got directions via Edge Function: ${ctx.walkingDirections.summary}`);
 
         // Publish to hub for multi-agent communication
         ctx.hub.publish({
@@ -1835,8 +2653,8 @@ async function getWalkingDirectionsFromMapbox(ctx: PipelineContext): Promise<Age
             source: 'WalkingDirectionsAgent',
             payload: {
                 destinationStop: nearestStop.stop.name,
-                distanceMeters,
-                durationMinutes,
+                distanceMeters: walkingRoute.distanceMeters,
+                durationMinutes: walkingRoute.durationMinutes,
                 stepsCount: steps.length,
                 summary: ctx.walkingDirections.summary
             },
@@ -1848,11 +2666,11 @@ async function getWalkingDirectionsFromMapbox(ctx: PipelineContext): Promise<Age
             agentName: 'WalkingDirectionsAgent',
             data: {
                 destinationStop: nearestStop.stop.name,
-                distanceMeters,
-                durationMinutes,
+                distanceMeters: walkingRoute.distanceMeters,
+                durationMinutes: walkingRoute.durationMinutes,
                 stepsCount: steps.length
             },
-            message: `Walking directions to ${nearestStop.stop.name}: ${durationMinutes} min (${distanceMeters}m)`,
+            message: `Walking directions to ${nearestStop.stop.name}: ${walkingRoute.durationMinutes} min (${walkingRoute.distanceMeters}m)`,
             confidence: 0.95,
             executionTimeMs: Date.now() - startTime
         };
@@ -2132,6 +2950,8 @@ interface DelegatedResponse {
     intent: string;
     routeData?: Record<string, unknown>;
     executionTimeMs: number;
+    // Add agentTrace to match Android ProcessQueryResponse model
+    agentTrace: Array<{ type: string; message: string; timestamp: number }>;
 }
 
 /**
@@ -2156,6 +2976,7 @@ async function callEdgeFunction(
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
+            'apikey': serviceKey,
             'Authorization': `Bearer ${serviceKey}`
         },
         body: JSON.stringify(payload)
@@ -2168,6 +2989,143 @@ async function callEdgeFunction(
     }
 
     return await response.json();
+}
+
+/**
+ * Call get-route-stops fetcher specifically for ordered map visualizations.
+ * Uses GET as required by latest backend code.
+ */
+async function callGetRouteStops(vehicleIds: string[]): Promise<any> {
+    const supabaseUrl = Deno.env.get('SUPABASE_URL');
+    const serviceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY');
+
+    if (!supabaseUrl || !serviceKey) return null;
+
+    const url = new URL(`${supabaseUrl}/functions/v1/get-route-stops`);
+    url.searchParams.set('vehicle_ids', vehicleIds.join(','));
+    url.searchParams.set('include_vehicle_info', 'true');
+
+    try {
+        const res = await fetch(url.toString(), {
+            headers: {
+                'apikey': serviceKey,
+                'Authorization': `Bearer ${serviceKey}`
+            }
+        });
+        if (res.ok) return await res.json();
+    } catch (e) {
+        console.warn(`[get-route-stops] Call failed:`, e);
+    }
+    return null;
+}
+
+// ============================================================================
+// ROUTE QUERY HELPERS - For AI Agent Pathfinding
+// ============================================================================
+
+/**
+ * Get ordered route stops for a specific vehicle.
+ * Critical for AI pathfinding - returns stops in their sequence order.
+ * 
+ * SQL equivalent:
+ * SELECT id, name, latitude, longitude, stop_order
+ * FROM route_stops
+ * WHERE vehicle_id = ?
+ * ORDER BY stop_order ASC;
+ */
+async function getOrderedRouteStops(vehicleId: string): Promise<RouteStop[]> {
+    const client = getSupabase();
+    const { data, error } = await client
+        .from('route_stops')
+        .select('id, name, latitude, longitude, stop_order')
+        .eq('vehicle_id', vehicleId)
+        .order('stop_order', { ascending: true });
+
+    if (error) {
+        console.error(`[getOrderedRouteStops] Error for vehicle ${vehicleId}:`, error);
+        throw error;
+    }
+    return (data || []).map(s => ({ ...s, vehicle_id: vehicleId }));
+}
+
+/**
+ * Find buses/vehicles passing through a specific stop name.
+ * For AI matching when user asks "which buses go through X?"
+ * 
+ * SQL equivalent:
+ * SELECT DISTINCT vehicle_id
+ * FROM route_stops
+ * WHERE name ILIKE '%stop_name%';
+ */
+async function findBusesByStopName(stopName: string): Promise<string[]> {
+    const client = getSupabase();
+    const { data, error } = await client
+        .from('route_stops')
+        .select('vehicle_id')
+        .ilike('name', `%${stopName}%`);
+
+    if (error) {
+        console.error(`[findBusesByStopName] Error for stop "${stopName}":`, error);
+        throw error;
+    }
+    // Deduplicate vehicle IDs
+    return [...new Set(((data || []) as { vehicle_id: string }[]).map(s => s.vehicle_id))];
+}
+
+/**
+ * Get the next stop in sequence after a given stop order.
+ * For navigation: "What's the next stop after X?"
+ * 
+ * SQL equivalent:
+ * SELECT id, name, latitude, longitude, stop_order
+ * FROM route_stops
+ * WHERE vehicle_id = ? AND stop_order > ?
+ * ORDER BY stop_order ASC
+ * LIMIT 1;
+ */
+async function getNextStopAfter(vehicleId: string, currentStopOrder: number): Promise<RouteStop | null> {
+    const client = getSupabase();
+    const { data, error } = await client
+        .from('route_stops')
+        .select('id, name, latitude, longitude, stop_order')
+        .eq('vehicle_id', vehicleId)
+        .gt('stop_order', currentStopOrder)
+        .order('stop_order', { ascending: true })
+        .limit(1)
+        .single();
+
+    if (error || !data) return null;
+    return { ...data, vehicle_id: vehicleId };
+}
+
+/**
+ * Get all routes grouped by vehicle ID.
+ * Useful for bulk operations and route comparison.
+ * 
+ * SQL equivalent:
+ * SELECT id, vehicle_id, name, latitude, longitude, stop_order
+ * FROM route_stops
+ * ORDER BY vehicle_id, stop_order ASC;
+ */
+async function getAllRoutesGrouped(): Promise<Record<string, RouteStop[]>> {
+    const client = getSupabase();
+    const { data, error } = await client
+        .from('route_stops')
+        .select('id, vehicle_id, name, latitude, longitude, stop_order')
+        .order('vehicle_id')
+        .order('stop_order', { ascending: true });
+
+    if (error) {
+        console.error('[getAllRoutesGrouped] Error:', error);
+        throw error;
+    }
+
+    const grouped: Record<string, RouteStop[]> = {};
+    for (const stop of data || []) {
+        if (!grouped[stop.vehicle_id]) grouped[stop.vehicle_id] = [];
+        grouped[stop.vehicle_id].push(stop);
+    }
+    return grouped;
 }
 
 /**
@@ -2202,7 +3160,8 @@ async function delegateToEndpoint(
                         nearestStop: result.nearestStop,
                         freshness: result.freshness
                     } : undefined,
-                    executionTimeMs: Date.now() - startTime
+                    executionTimeMs: Date.now() - startTime,
+                    agentTrace: [{ type: 'AGENT', message: 'track-bus agent completed', timestamp: Date.now() }]
                 };
             } catch (error) {
                 // Fallback to internal if Edge Function fails
@@ -2219,7 +3178,8 @@ async function delegateToEndpoint(
                         speed: result.speed,
                         nearestStop: result.nearestStop
                     } : undefined,
-                    executionTimeMs: Date.now() - startTime
+                    executionTimeMs: Date.now() - startTime,
+                    agentTrace: [{ type: 'AGENT', message: 'track-bus (internal fallback)', timestamp: Date.now() }]
                 };
             }
         }
@@ -2258,7 +3218,8 @@ async function delegateToEndpoint(
                     response: ((result.message as string) || 'Route found') + walkingInfo,
                     intent: 'FIND_ROUTE',
                     routeData: result.bestRoute as Record<string, unknown>,
-                    executionTimeMs: Date.now() - startTime
+                    executionTimeMs: Date.now() - startTime,
+                    agentTrace: [{ type: 'AGENT', message: 'find-route agent completed', timestamp: Date.now() }]
                 };
             } catch (error) {
                 // Fallback to internal if Edge Function fails
@@ -2273,7 +3234,8 @@ async function delegateToEndpoint(
                     response: result.message,
                     intent: 'FIND_ROUTE',
                     routeData: result.bestRoute as Record<string, unknown>,
-                    executionTimeMs: Date.now() - startTime
+                    executionTimeMs: Date.now() - startTime,
+                    agentTrace: [{ type: 'AGENT', message: 'find-route (internal fallback)', timestamp: Date.now() }]
                 };
             }
         }
@@ -2285,7 +3247,8 @@ async function delegateToEndpoint(
                     success: false,
                     response: 'Please share your location to find nearby stops.',
                     intent: 'FIND_NEARBY',
-                    executionTimeMs: Date.now() - startTime
+                    executionTimeMs: Date.now() - startTime,
+                    agentTrace: [{ type: 'ERROR', message: 'User location required', timestamp: Date.now() }]
                 };
             }
 
@@ -2319,7 +3282,8 @@ async function delegateToEndpoint(
                     response: ((result.message as string) || 'Found nearby stops') + walkingInfo,
                     intent: 'FIND_NEARBY',
                     routeData: { stops: result.stops, count: result.count },
-                    executionTimeMs: Date.now() - startTime
+                    executionTimeMs: Date.now() - startTime,
+                    agentTrace: [{ type: 'AGENT', message: 'get-nearby-stops agent completed', timestamp: Date.now() }]
                 };
             } catch (error) {
                 // Fallback to internal
@@ -2334,7 +3298,8 @@ async function delegateToEndpoint(
                     response: result.message || 'Found nearby stops',
                     intent: 'FIND_NEARBY',
                     routeData: { stops: result.stops, count: result.count },
-                    executionTimeMs: Date.now() - startTime
+                    executionTimeMs: Date.now() - startTime,
+                    agentTrace: [{ type: 'AGENT', message: 'get-nearby-stops (internal fallback)', timestamp: Date.now() }]
                 };
             }
         }
@@ -2369,7 +3334,10 @@ async function trackBusInternal(busRef: string): Promise<{
         // ========================================
         const { data: locations, error: locError } = await client
             .rpc('get_latest_bus_locations', { freshness_seconds: 60 });
-        
+
+        // Declare latestLocations outside the if/else blocks so it's accessible later
+        const latestLocations = new Map<string, LiveLocation>();
+
         if (locError) {
             console.warn('[trackBusInternal] RPC fallback to manual query:', locError);
             // Fallback to manual query if RPC not available
@@ -2378,8 +3346,7 @@ async function trackBusInternal(busRef: string): Promise<{
                 .select('*')
                 .order('timestamp', { ascending: false })
                 .limit(1000); // Limit for performance
-            
-            const latestLocations = new Map<string, LiveLocation>();
+
             for (const loc of (rawLocations || []) as LiveLocation[]) {
                 if (!latestLocations.has(loc.bus_id)) {
                     latestLocations.set(loc.bus_id, loc);
@@ -2387,7 +3354,6 @@ async function trackBusInternal(busRef: string): Promise<{
             }
         } else {
             // Convert RPC result to Map
-            const latestLocations = new Map<string, LiveLocation>();
             for (const loc of (locations || []) as LiveLocation[]) {
                 latestLocations.set(loc.bus_id, loc);
             }
@@ -2400,9 +3366,9 @@ async function trackBusInternal(busRef: string): Promise<{
         const busRefLower = busRef.toLowerCase();
         for (const [busId, loc] of latestLocations) {
             const vehicle = (vehicles as Vehicle[])?.find(v => v.id === busId);
-            if (vehicle?.name.toLowerCase().includes(busRefLower) ||
-                vehicle?.vehicle_number.toLowerCase().includes(busRefLower) ||
-                busId.includes(busRefLower)) {
+            if ((vehicle?.name?.toLowerCase()?.includes(busRefLower)) ||
+                (vehicle?.vehicle_number?.toLowerCase()?.includes(busRefLower)) ||
+                busId.toLowerCase().includes(busRefLower)) {
                 targetLocation = loc;
                 targetVehicle = vehicle;
                 break;
@@ -2459,6 +3425,7 @@ async function trackBusInternal(busRef: string): Promise<{
 
 /**
  * Internal find-route implementation
+ * OPTIMIZED: Early active vehicle filtering, deduplication, vehicle_id intersection
  */
 async function findRouteInternal(
     origin: string | undefined,
@@ -2473,48 +3440,103 @@ async function findRouteInternal(
     try {
         const client = getSupabase();
 
-        // Fetch all stops
-        const { data: allStops } = await client
+        // FIX Issue 4: Fetch stops with INNER JOIN on active vehicles EARLY
+        const { data: allStopsRaw, error: stopsError } = await client
             .from('route_stops')
-            .select('*')
+            .select(`
+                id, vehicle_id, name, latitude, longitude, stop_order,
+                vehicles!inner(is_active)
+            `)
+            .eq('vehicles.is_active', true)
             .order('vehicle_id')
             .order('stop_order');
 
-        if (!allStops || allStops.length === 0) {
+        if (stopsError) {
+            console.error('[findRouteInternal] Error fetching stops:', stopsError);
+            throw stopsError;
+        }
+
+        if (!allStopsRaw || allStopsRaw.length === 0) {
             return { success: false, message: 'No bus stops found in the system.' };
         }
+
+        // Map to RouteStop type (strip nested vehicles object)
+        const allStops: RouteStop[] = (allStopsRaw as any[]).map(s => ({
+            id: s.id,
+            vehicle_id: s.vehicle_id,
+            name: s.name,
+            latitude: s.latitude,
+            longitude: s.longitude,
+            stop_order: s.stop_order
+        }));
 
         const destLower = destination.toLowerCase();
         const originLower = origin?.toLowerCase() || '';
 
-        const destStops = (allStops as RouteStop[]).filter(s => s.name.toLowerCase().includes(destLower));
+        const destStops = allStops.filter(s => s.name.toLowerCase().includes(destLower));
 
         if (destStops.length === 0) {
             return { success: false, message: `Sorry, I couldn't find any stops matching "${destination}".` };
         }
 
+        // FIX Issue 2: Search origin stops separately and intersect by vehicle_id
+        let originStops: RouteStop[] = [];
+        if (origin) {
+            originStops = allStops.filter(s => s.name.toLowerCase().includes(originLower));
+        }
+
+        // Get common vehicle IDs (routes with BOTH origin AND destination)
+        const destVehicleIds = new Set(destStops.map(s => s.vehicle_id));
+        let commonVehicleIds: string[];
+
+        if (originStops.length > 0) {
+            const originVehicleIds = new Set(originStops.map(s => s.vehicle_id));
+            commonVehicleIds = [...destVehicleIds].filter(id => originVehicleIds.has(id));
+            console.log(`[findRouteInternal] Intersected: ${commonVehicleIds.length} common vehicles`);
+        } else {
+            commonVehicleIds = [...destVehicleIds];
+        }
+
+        if (commonVehicleIds.length === 0 && origin) {
+            return { success: false, message: `Sorry, I couldn't find a direct route from "${origin}" to "${destination}".` };
+        }
+
+        // Filter stops to only common vehicles
+        const relevantStops = allStops.filter(s => commonVehicleIds.includes(s.vehicle_id));
+
         // Group stops by vehicle
         const vehicleStopsMap = new Map<string, RouteStop[]>();
-        for (const stop of allStops as RouteStop[]) {
+        for (const stop of relevantStops) {
             const existing = vehicleStopsMap.get(stop.vehicle_id) || [];
             existing.push(stop);
             vehicleStopsMap.set(stop.vehicle_id, existing);
         }
 
-        // Find matching routes
+        // Find matching routes with DEDUPLICATION
         const matches: Array<{ vehicleId: string; originStop: RouteStop; destStop: RouteStop; stopsInPath: RouteStop[]; distance: number }> = [];
 
-        for (const destStop of destStops) {
+        // FIX Issue 3: Track seen routes to prevent duplicates
+        const seenRoutes = new Set<string>();
+
+        // Create origin stop IDs set for O(1) lookup
+        const originStopIds = new Set(originStops.map(s => s.id));
+
+        for (const destStop of destStops.filter(s => commonVehicleIds.includes(s.vehicle_id))) {
             const vehicleStops = vehicleStopsMap.get(destStop.vehicle_id) || [];
             // Sort by stop_order
             vehicleStops.sort((a, b) => a.stop_order - b.stop_order);
 
-            if (origin) {
-                // User provided an origin name - match by name
+            if (origin && originStops.length > 0) {
+                // User provided an origin name - match by ID
                 const validOrigins = vehicleStops.filter(s =>
-                    s.name.toLowerCase().includes(originLower) && s.stop_order < destStop.stop_order
+                    originStopIds.has(s.id) && s.stop_order < destStop.stop_order
                 );
                 for (const originStop of validOrigins) {
+                    // Dedupe with composite key
+                    const routeKey = `${destStop.vehicle_id}:${originStop.stop_order}:${destStop.stop_order}`;
+                    if (seenRoutes.has(routeKey)) continue;
+                    seenRoutes.add(routeKey);
+
                     const stopsInPath = vehicleStops
                         .filter(s => s.stop_order >= originStop.stop_order && s.stop_order <= destStop.stop_order);
 
@@ -2540,6 +3562,11 @@ async function findRouteInternal(
                 }
                 // Increased radius to 5km for better coverage
                 if (closestStop && closestDist < 5) {
+                    // Dedupe
+                    const routeKey = `${destStop.vehicle_id}:${closestStop.stop_order}:${destStop.stop_order}`;
+                    if (seenRoutes.has(routeKey)) continue;
+                    seenRoutes.add(routeKey);
+
                     const stopsInPath = vehicleStops
                         .filter(s => s.stop_order >= closestStop!.stop_order && s.stop_order <= destStop.stop_order);
 
@@ -2557,6 +3584,12 @@ async function findRouteInternal(
                 const stopsBeforeDest = vehicleStops.filter(s => s.stop_order < destStop.stop_order);
                 if (stopsBeforeDest.length > 0) {
                     const originStop = stopsBeforeDest[0]; // First stop on route
+
+                    // Dedupe
+                    const routeKey = `${destStop.vehicle_id}:${originStop.stop_order}:${destStop.stop_order}`;
+                    if (seenRoutes.has(routeKey)) continue;
+                    seenRoutes.add(routeKey);
+
                     const stopsInPath = vehicleStops
                         .filter(s => s.stop_order >= originStop.stop_order && s.stop_order <= destStop.stop_order);
 
@@ -2571,6 +3604,8 @@ async function findRouteInternal(
                 }
             }
         }
+
+        console.log(`[findRouteInternal] Found ${matches.length} unique routes (deduped)`);
 
         if (matches.length === 0) {
             return { success: false, message: `Sorry, I couldn't find a direct route to "${destination}".` };
@@ -2600,48 +3635,50 @@ async function findRouteInternal(
         } | undefined;
 
         if (userLocation) {
-            const accessToken = Deno.env.get('MAPBOX_ACCESS_TOKEN');
-            if (accessToken) {
+            // Call get-walking-directions Edge Function instead of direct Mapbox API
+            const supabaseUrl = Deno.env.get('SUPABASE_URL');
+            const serviceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY');
+
+            if (supabaseUrl && serviceKey) {
                 try {
                     const originStop = best.originStop;
-                    // Mapbox uses lng,lat format
-                    const coordinates = `${userLocation.longitude},${userLocation.latitude};${originStop.longitude},${originStop.latitude}`;
-                    const mapboxUrl = `${MAPBOX_API_URL}/${coordinates}?` + new URLSearchParams({
-                        access_token: accessToken,
-                        steps: 'true',
-                        overview: 'full',
-                        geometries: 'polyline',
-                        language: 'en'
+                    console.log(`[WalkingDirections] Delegating to Edge Function for ${originStop.name}...`);
+
+                    const walkResponse = await fetch(`${supabaseUrl}/functions/v1/get-walking-directions`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'apikey': serviceKey,
+                            'Authorization': `Bearer ${serviceKey}`
+                        },
+                        body: JSON.stringify({
+                            originLat: userLocation.latitude,
+                            originLng: userLocation.longitude,
+                            destLat: originStop.latitude,
+                            destLng: originStop.longitude,
+                            destStopName: originStop.name,
+                            language: 'en'
+                        })
                     });
 
-                    console.log(`[MapboxAgent] Getting walking directions to ${originStop.name}`);
-                    const mapboxResponse = await fetch(mapboxUrl);
-
-                    if (mapboxResponse.ok) {
-                        const mapboxData = await mapboxResponse.json();
-                        if (mapboxData.routes && mapboxData.routes.length > 0) {
-                            const route = mapboxData.routes[0];
-                            const legs = route.legs[0];
-
-                            const steps: Array<{ instruction: string; distance: number }> = (legs.steps || []).map((step: {
-                                maneuver?: { instruction?: string };
-                                distance?: number;
-                            }) => ({
-                                instruction: step.maneuver?.instruction || 'Continue',
-                                distance: Math.round(step.distance || 0)
-                            }));
-
+                    if (walkResponse.ok) {
+                        const walkData = await walkResponse.json();
+                        if (walkData.success && walkData.walkingRoute) {
+                            const route = walkData.walkingRoute;
                             walkingDirections = {
-                                distanceMeters: Math.round(route.distance),
-                                durationMinutes: Math.ceil(route.duration / 60),
-                                steps,
-                                summary: `${Math.ceil(route.duration / 60)} min walk (${Math.round(route.distance)}m)`
+                                distanceMeters: route.distanceMeters,
+                                durationMinutes: route.durationMinutes,
+                                steps: (route.steps || []).map((step: { instruction: string; distance: number }) => ({
+                                    instruction: step.instruction,
+                                    distance: step.distance
+                                })),
+                                summary: route.summary || `${route.durationMinutes} min walk (${route.distanceMeters}m)`
                             };
-                            console.log(`[MapboxAgent] Walking: ${walkingDirections.summary}`);
+                            console.log(`[WalkingDirections] Got: ${walkingDirections.summary}`);
                         }
                     }
-                } catch (mapboxError) {
-                    console.warn('[MapboxAgent] Walking directions failed:', mapboxError);
+                } catch (walkError) {
+                    console.warn('[WalkingDirections] Edge Function call failed:', walkError);
                     // Continue without walking directions - graceful degradation
                 }
             }
@@ -2756,6 +3793,284 @@ async function findNearbyStopsInternal(
 }
 
 // ============================================================================
+// MAP-ACTION PIPELINE: Entity Resolution & Map Commands
+// ============================================================================
+
+/**
+ * Resolve visual queries by cross-referencing viewport entities.
+ * When user asks "what is that bus?" or uses deictic references like "that", "this",
+ * we identify the most likely entity they're referring to.
+ */
+async function resolveVisualQuery(ctx: PipelineContext): Promise<{
+    resolvedBusId?: string;
+    resolvedStopId?: string;
+    resolvedEntity?: { type: 'bus' | 'stop'; name: string; id: string };
+    confidence: number;
+}> {
+    if (!ctx.viewportState || !ctx.visibleEntities) {
+        console.log('[VisualQuery] No viewport state or visible entities');
+        return { confidence: 0 };
+    }
+
+    const buses = ctx.visibleEntities.buses || [];
+    const stops = ctx.visibleEntities.stops || [];
+
+    // Check if query mentions specific bus name/number
+    const busNameFromQuery = ctx.intent?.entities?.busName;
+
+    if (busNameFromQuery && buses.length > 0) {
+        // Try to match query bus name with visible buses
+        const matchedBus = buses.find(b =>
+            b.vehicle_name.toLowerCase().includes(busNameFromQuery.toLowerCase())
+        );
+        if (matchedBus) {
+            console.log(`[VisualQuery] Matched bus "${matchedBus.vehicle_name}" from query`);
+            return {
+                resolvedBusId: matchedBus.bus_id,
+                resolvedEntity: { type: 'bus', name: matchedBus.vehicle_name, id: matchedBus.bus_id },
+                confidence: 0.9
+            };
+        }
+    }
+
+    // If only one bus is visible, assume user is referring to it
+    if (buses.length === 1) {
+        const bus = buses[0];
+        console.log(`[VisualQuery] Only one bus visible: ${bus.vehicle_name}`);
+        return {
+            resolvedBusId: bus.bus_id,
+            resolvedEntity: { type: 'bus', name: bus.vehicle_name, id: bus.bus_id },
+            confidence: 0.8
+        };
+    }
+
+    // If multiple buses, pick the one closest to viewport center
+    if (buses.length > 1 && ctx.viewportState) {
+        const centerLat = ctx.viewportState.centerLat;
+        const centerLng = ctx.viewportState.centerLng;
+
+        let closestBus = buses[0];
+        let minDist = Infinity;
+
+        for (const bus of buses) {
+            const dist = haversineDistance(centerLat, centerLng, bus.latitude, bus.longitude);
+            if (dist < minDist) {
+                minDist = dist;
+                closestBus = bus;
+            }
+        }
+
+        console.log(`[VisualQuery] Closest bus to center: ${closestBus.vehicle_name}`);
+        return {
+            resolvedBusId: closestBus.bus_id,
+            resolvedEntity: { type: 'bus', name: closestBus.vehicle_name, id: closestBus.bus_id },
+            confidence: 0.6
+        };
+    }
+
+    return { confidence: 0 };
+}
+
+/**
+ * Detect route deviation (ghost bus) by checking if bus is off its defined route.
+ * Calls the detect_route_deviation RPC function.
+ */
+async function detectGhostBus(busId: string): Promise<{
+    isDeviated: boolean;
+    deviationStatus: 'on_route' | 'minor_deviation' | 'significant_deviation';
+    nearestStop?: string;
+    distanceKm?: number;
+}> {
+    try {
+        const supabase = getSupabase();
+        const { data, error } = await supabase.rpc('detect_route_deviation', {
+            p_bus_id: busId,
+            deviation_threshold_km: 0.5
+        });
+
+        if (error) {
+            console.error('[GhostBus] RPC error:', error);
+            return { isDeviated: false, deviationStatus: 'on_route' };
+        }
+
+        console.log(`[GhostBus] Bus ${busId}: ${data.deviation_status}`);
+
+        return {
+            isDeviated: data.is_deviated || false,
+            deviationStatus: data.deviation_status || 'on_route',
+            nearestStop: data.nearest_stop,
+            distanceKm: data.distance_km
+        };
+    } catch (e) {
+        console.error('[GhostBus] Exception:', e);
+        return { isDeviated: false, deviationStatus: 'on_route' };
+    }
+}
+
+/**
+ * Fetch entities visible in the user's viewport.
+ * Calls the get_entities_in_viewport RPC function.
+ */
+async function fetchVisibleEntities(ctx: PipelineContext): Promise<void> {
+    if (!ctx.viewportState) {
+        console.log('[FetchEntities] No viewport state');
+        return;
+    }
+
+    try {
+        const supabase = getSupabase();
+        const { data, error } = await supabase.rpc('get_entities_in_viewport', {
+            north: ctx.viewportState.boundingBox.north,
+            south: ctx.viewportState.boundingBox.south,
+            east: ctx.viewportState.boundingBox.east,
+            west: ctx.viewportState.boundingBox.west,
+            max_results: 50,
+            freshness_seconds: 60
+        });
+
+        if (error) {
+            console.error('[FetchEntities] RPC error:', error);
+            return;
+        }
+
+        ctx.visibleEntities = {
+            buses: data?.buses || [],
+            stops: data?.stops || []
+        };
+
+        console.log(`[FetchEntities] Found ${ctx.visibleEntities.buses.length} buses, ${ctx.visibleEntities.stops.length} stops in viewport`);
+    } catch (e) {
+        console.error('[FetchEntities] Exception:', e);
+    }
+}
+
+/**
+ * Generate map commands based on the pipeline context.
+ * The AI uses these commands to control what the user sees on the map.
+ */
+function generateMapCommands(ctx: PipelineContext): MapCommand[] {
+    const commands: MapCommand[] = [];
+
+    // Case 1: Best route found - highlight the route path
+    if (ctx.bestRoute) {
+        const route = ctx.bestRoute;
+
+        // Build path coordinates from route stops
+        const pathCoordinates: { lat: number; lng: number }[] = [];
+        if (ctx.allStops) {
+            const routeStops = ctx.allStops
+                .filter(s => s.vehicle_id === route.vehicleId)
+                .sort((a, b) => a.stop_order - b.stop_order);
+
+            routeStops.forEach(stop => {
+                pathCoordinates.push({ lat: stop.latitude, lng: stop.longitude });
+            });
+        }
+
+        if (pathCoordinates.length > 0) {
+            const geoJSON: any = {
+                type: 'Feature',
+                geometry: {
+                    type: 'LineString',
+                    coordinates: pathCoordinates.map(p => [p.lng, p.lat])
+                },
+                properties: {
+                    type: 'route',
+                    vehicleId: route.vehicleId,
+                    vehicleName: route.vehicleName,
+                    stroke: '#2196F3',
+                    'stroke-width': 4
+                }
+            };
+
+            commands.push({
+                action: 'HIGHLIGHT_PATH',
+                target_bus_id: route.vehicleId,
+                reasoning_color: '#2196F3', // Blue for route
+                message: `Route: ${route.originStop} to ${route.destinationStop}`,
+                geoJSON
+            });
+        }
+    }
+
+    // Case 2: Tracking a specific bus - focus and highlight (including its path)
+    if (ctx.intent?.primaryIntent === 'TRACK_BUS' && ctx.filteredBuses && ctx.filteredBuses.length > 0) {
+        const bus = ctx.filteredBuses[0];
+
+        // Build path for the tracked bus as well
+        const pathCoordinates: { lat: number; lng: number }[] = [];
+        if (ctx.allStops) {
+            const busStops = ctx.allStops
+                .filter(s => s.vehicle_id === bus.vehicle.id)
+                .sort((a, b) => a.stop_order - b.stop_order);
+
+            busStops.forEach(stop => {
+                pathCoordinates.push({ lat: stop.latitude, lng: stop.longitude });
+            });
+        }
+
+        const geoJSON: any = pathCoordinates.length > 0 ? {
+            type: 'Feature',
+            geometry: {
+                type: 'LineString',
+                coordinates: pathCoordinates.map(p => [p.lng, p.lat])
+            },
+            properties: {
+                type: 'tracking_path',
+                vehicleId: bus.vehicle.id,
+                stroke: '#4CAF50',
+                'stroke-width': 4
+            }
+        } : undefined;
+
+        commands.push({
+            action: 'FOCUS_AND_HIGHLIGHT',
+            target_bus_id: bus.vehicle.id,
+            coordinates: bus.latestLocation ? { lat: bus.latestLocation.latitude, lng: bus.latestLocation.longitude } : undefined,
+            reasoning_color: '#4CAF50',
+            message: `Tracking ${bus.vehicle.name} (${bus.vehicle.vehicle_number})`,
+            zoom_level: 16,
+            geoJSON
+        });
+    }
+
+    // Case 3: Visual query resolved - zoom to the identified entity
+    if (ctx.visibleEntities) {
+        // If we resolved a visual query entity, zoom to it
+        const resolvedBus = ctx.visibleEntities.buses.find(b =>
+            ctx.intent?.entities?.busName &&
+            b.vehicle_name.toLowerCase().includes(ctx.intent.entities.busName.toLowerCase())
+        );
+
+        if (resolvedBus) {
+            commands.push({
+                action: 'ZOOM_TO',
+                target_bus_id: resolvedBus.bus_id,
+                coordinates: { lat: resolvedBus.latitude, lng: resolvedBus.longitude },
+                message: `Focusing on ${resolvedBus.vehicle_name}`,
+                zoom_level: 17
+            });
+        }
+    }
+
+    // Case 4: Nearby stops query - add markers for nearest stops
+    if (ctx.intent?.primaryIntent === 'FIND_NEARBY' && ctx.nearestStops && ctx.nearestStops.length > 0) {
+        const nearestStop = ctx.nearestStops[0];
+
+        commands.push({
+            action: 'ADD_MARKER',
+            target_stop_id: nearestStop.stop.id,
+            coordinates: { lat: nearestStop.stop.latitude, lng: nearestStop.stop.longitude },
+            reasoning_color: '#FF9800', // Orange for highlighted stop
+            message: `Stop: ${nearestStop.stop.name}`
+        });
+    }
+
+    console.log(`[MapCommands] Generated ${commands.length} map commands`);
+    return commands;
+}
+
+// ============================================================================
 // MAIN PIPELINE ORCHESTRATOR
 // ============================================================================
 
@@ -2862,13 +4177,27 @@ async function executePipeline(ctx: PipelineContext): Promise<string> {
     }
 
     // ========================================
-    // INTENT-SPECIFIC AGENTS
+    // INTENT-SPECIFIC AGENTS (PARALLEL for FIND_ROUTE)
     // ========================================
     switch (ctx.intent.primaryIntent) {
         case 'FIND_ROUTE':
-            console.log('[RouteAgent] Finding routes...');
-            const routeResult = await findRoutes(ctx);
+            // ========================================
+            // PHASE 2: PARALLEL Route Discovery
+            // Run direct routes + multi-hop routes simultaneously
+            // ========================================
+            console.log('[RouteDiscovery] Running parallel route agents...');
+            const routeDiscoveryStart = Date.now();
+
+            const [routeResult, multiHopResult] = await Promise.all([
+                findRoutes(ctx),
+                findMultiHopRoutes(ctx)
+            ]);
+
             ctx.agentResults.set('RouteAgent', routeResult);
+            ctx.agentResults.set('MultiHopRouteAgent', multiHopResult);
+
+            console.log(`[RouteDiscovery] Parallel phase complete in ${Date.now() - routeDiscoveryStart}ms`);
+            console.log(`[RouteDiscovery] Direct routes: ${ctx.allRoutes?.length || 0}, Multi-hop: ${ctx.multiHopRoutes?.length || 0}`);
             break;
 
         case 'TRACK_BUS':
@@ -2883,28 +4212,52 @@ async function executePipeline(ctx: PipelineContext): Promise<string> {
     }
 
     // ========================================
-    // GEOCODING AGENT: Place name enrichment
+    // PHASE 3: PARALLEL Enrichment Agents
     // ========================================
-    console.log('[GeocodingAgent] Enriching locations...');
-    const geoResult = await enrichWithPlaceNames(ctx);
-    ctx.agentResults.set('GeocodingAgent', geoResult);
+    console.log('[Enrichment] Running parallel enrichment agents...');
+    const enrichmentStart = Date.now();
 
-    // ========================================
-    // WALKING DIRECTIONS AGENT: Get route to nearest stop
-    // ========================================
+    const enrichmentPromises: Promise<AgentOutput>[] = [
+        enrichWithPlaceNames(ctx)
+    ];
+
+    // Add conditional enrichment agents
     if (ctx.userLocation && ctx.nearestStops && ctx.nearestStops.length > 0) {
-        console.log('[WalkingDirectionsAgent] Getting walking directions...');
-        const walkResult = await getWalkingDirectionsFromMapbox(ctx);
-        ctx.agentResults.set('WalkingDirectionsAgent', walkResult);
+        enrichmentPromises.push(getWalkingDirectionsFromMapbox(ctx));
     }
 
-    // ========================================
-    // BUS PREDICTION AGENT: Arrival predictions
-    // ========================================
     if (ctx.nearestStops && ctx.nearestStops.length > 0 && ctx.latestLocations && ctx.latestLocations.length > 0) {
-        console.log('[BusPredictionAgent] Predicting arrivals...');
-        const predictionResult = await predictBusArrivals(ctx);
-        ctx.agentResults.set('BusPredictionAgent', predictionResult);
+        enrichmentPromises.push(predictBusArrivals(ctx));
+    }
+
+    const enrichmentResults = await Promise.all(enrichmentPromises);
+    enrichmentResults.forEach(result => {
+        ctx.agentResults.set(result.agentName, result);
+    });
+
+    console.log(`[Enrichment] Parallel phase complete in ${Date.now() - enrichmentStart}ms`);
+
+    // ========================================
+    // MAP-ACTION PIPELINE: Viewport Entity Fetching
+    // ========================================
+    if (ctx.viewportState) {
+        console.log('[MapActionPipeline] Fetching visible entities...');
+        await fetchVisibleEntities(ctx);
+
+        // If query requires visual context, resolve the referenced entity
+        if (ctx.visibleEntities && ctx.visibleEntities.buses.length > 0) {
+            console.log('[MapActionPipeline] Resolving visual query...');
+            const resolution = await resolveVisualQuery(ctx);
+            if (resolution.resolvedEntity) {
+                console.log(`[MapActionPipeline] Resolved to: ${resolution.resolvedEntity.type} "${resolution.resolvedEntity.name}"`);
+                // Add resolved entity to intent for use in response
+                if (!ctx.intent?.entities?.busName && resolution.resolvedEntity.type === 'bus') {
+                    if (ctx.intent?.entities) {
+                        ctx.intent.entities.busName = resolution.resolvedEntity.name;
+                    }
+                }
+            }
+        }
     }
 
     // ========================================
@@ -2912,6 +4265,13 @@ async function executePipeline(ctx: PipelineContext): Promise<string> {
     // ========================================
     console.log('[Layer5] Generating grounded response...');
     const response = await generateGroundedResponse(ctx.query, ctx);
+
+    // ========================================
+    // MAP-ACTION PIPELINE: Generate Map Commands
+    // ========================================
+    console.log('[MapActionPipeline] Generating map commands...');
+    ctx.mapCommands = generateMapCommands(ctx);
+
     console.log('[Pipeline] Complete');
 
     return response;
@@ -2927,114 +4287,212 @@ const corsHeaders = {
     'Access-Control-Allow-Methods': 'POST, OPTIONS'
 };
 
-serve(async (req: Request) => {
+// ============================================================================
+// MAIN HANDLER (STREAMING SUPPORT)
+// ============================================================================
+
+
+Deno.serve(async (req) => {
+    // 1. Handle CORS Preflight
     if (req.method === 'OPTIONS') {
         return new Response('ok', { headers: corsHeaders });
     }
 
-    if (req.method !== 'POST') {
-        return new Response(JSON.stringify({ error: 'Method not allowed' }), {
-            status: 405,
-            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-        });
-    }
-
     try {
-        const { userId, query, userLocation } = await req.json();
+        // 2. Parse Request (includes viewportState for Map-Action Pipeline)
+        const { query, userLocation, userId, viewportState } = await req.json();
 
-        if (!userId || !query) {
-            return new Response(JSON.stringify({ error: 'userId and query required' }), {
-                status: 400,
-                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-            });
+        if (viewportState) {
+            console.log('[Request] Viewport state received:', JSON.stringify(viewportState));
         }
 
-        // ============================================
-        // INTENT-BASED ROUTING (Phase 2)
-        // Fast-path to specialized endpoints for common query types
-        // ============================================
-        const routeDecision = routeByIntent(query, userLocation);
-        console.log(`[Router] Intent: ${routeDecision.endpoint} (${Math.round(routeDecision.confidence * 100)}%) - ${routeDecision.reasoning}`);
-
-        if (shouldUseSpecializedEndpoint(routeDecision)) {
-            console.log(`[Router] Delegating to specialized endpoint: ${routeDecision.endpoint}`);
-
-            try {
-                const delegatedResponse = await delegateToEndpoint(routeDecision, userLocation, userId);
-                return new Response(JSON.stringify(delegatedResponse), {
-                    headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-                });
-            } catch (delegateError) {
-                console.warn(`[Router] Delegation failed, falling back to pipeline:`, delegateError);
-                // Fall through to full pipeline
+        // 3. Create Streaming Response
+        const encoder = new TextEncoder();
+        const stream = new ReadableStream({
+            async start(controller) {
+                try {
+                    await streamResponse(controller, encoder, query, userLocation, userId, viewportState);
+                } catch (error) {
+                    console.error('Stream error:', error);
+                    const errorMsg = JSON.stringify({
+                        type: 'error',
+                        error: error instanceof Error ? error.message : 'Unknown error'
+                    }) + '\n\n';
+                    controller.enqueue(encoder.encode(errorMsg));
+                    controller.close();
+                }
             }
-        }
+        });
 
-        // ============================================
-        // FULL PIPELINE (for complex/ambiguous queries)
-        // ============================================
-
-        // Initialize pipeline context with communication hub
-        const ctx: PipelineContext = {
-            userId,
-            query,
-            userLocation,
-            startTime: Date.now(),
-            hub: createCommunicationHub(),
-            agentResults: new Map()
-        };
-
-        // Execute 5-layer pipeline
-        const response = await executePipeline(ctx);
-
-        // Save to search history
-        try {
-            await getSupabase().from('search_history').insert({
-                user_id: userId,
-                query,
-                intent: ctx.intent?.primaryIntent || 'UNKNOWN',
-                origin_name: ctx.intent?.entities.origin,
-                destination_name: ctx.intent?.entities.destination,
-                response,
-                success: ctx.bestRoute !== undefined || (ctx.nearestStops && ctx.nearestStops.length > 0),
-                confidence: ctx.intent?.confidence || 0.5,
-                execution_time_ms: Date.now() - ctx.startTime,
-                user_location: userLocation ? { latitude: userLocation.latitude, longitude: userLocation.longitude } : null
-            });
-        } catch (e) {
-            console.error('Failed to save history:', e);
-        }
-
-        return new Response(JSON.stringify({
-            success: true,
-            response,
-            intent: ctx.intent?.primaryIntent,
-            confidence: ctx.intent?.confidence,
-            routeData: ctx.bestRoute,
-            alternatives: ctx.alternatives,
-            nearbyStops: ctx.nearestStops?.slice(0, 3).map(s => ({
-                name: s.stop.name,
-                distance: s.distanceKm,
-                walkTime: s.walkTimeMinutes,
-                bus: s.vehicleName
-            })),
-            executionTimeMs: Date.now() - ctx.startTime,
-            agentResults: Object.fromEntries(
-                Array.from(ctx.agentResults.entries()).map(([k, v]) => [k, { success: v.success, message: v.message }])
-            )
-        }), {
-            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        // 4. Return Stream with SSE-compatible headers
+        return new Response(stream, {
+            headers: {
+                ...corsHeaders,
+                'Content-Type': 'text/event-stream',
+                'Cache-Control': 'no-cache',
+                'Connection': 'keep-alive',
+            }
         });
 
     } catch (error) {
-        console.error('Pipeline error:', error);
-        return new Response(JSON.stringify({
-            success: false,
-            response: 'Something went wrong. Please try again.',
-            error: error instanceof Error ? error.message : 'Unknown error'
-        }), {
-            status: 500,
-            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-        });
+        return new Response(
+            JSON.stringify({ error: error instanceof Error ? error.message : 'Internal Server Error' }),
+            { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+        );
     }
 });
+
+// ============================================================================
+// STREAMING ORCHESTRATOR
+// ============================================================================
+
+/**
+ * Orchestrates the streaming response with REAL AI Reasoning:
+ * 1. Emits initial "thinking" event
+ * 2. Calls backend agents (OpenRouter with reasoning enabled)
+ * 3. Streams "reasoning" events from OpenRouter's reasoning_details
+ * 4. Emits "final_response" event with the result
+ */
+async function streamResponse(
+    controller: ReadableStreamDefaultController,
+    encoder: TextEncoder,
+    query: string,
+    userLocation: any,
+    userId: string,
+    viewportState?: ViewportState
+) {
+    const send = (type: string, data: any) => {
+        const payload = JSON.stringify({ type, data }) + '\n\n'; // Double newline for SSE/delimiters
+        controller.enqueue(encoder.encode(payload));
+    };
+
+    // --- STEP 1: INITIAL THINKING ---
+    send('thinking', 'Processing your request...');
+    await delay(100);
+
+    const startTime = Date.now();
+    let result: any;
+    let reasoningDetails: OpenRouterReasoningDetail[] = [];
+
+    try {
+        // Fast-path routing logic
+        const routeDecision = routeByIntent(query, userLocation);
+
+        if (shouldUseSpecializedEndpoint(routeDecision)) {
+            // For specialized endpoints, we use simulated reasoning briefly
+            send('reasoning', 'Identifying query intent...');
+            await delay(150);
+
+            if (routeDecision.endpoint === EndpointType.TRACK_BUS) {
+                const paramBus = routeDecision.extractedParams.busName || routeDecision.extractedParams.busNumber || 'bus';
+                send('reasoning', `Looking up "${paramBus}" in the database...`);
+                await delay(150);
+                send('reasoning', 'Connecting to real-time GPS tracking...');
+            } else if (routeDecision.endpoint === EndpointType.FIND_ROUTE) {
+                send('reasoning', 'Extracting origin and destination...');
+                await delay(150);
+                send('reasoning', 'Searching for optimal bus routes...');
+            } else if (routeDecision.endpoint === EndpointType.NEARBY_STOPS) {
+                send('reasoning', 'Getting your current location...');
+                await delay(150);
+                send('reasoning', 'Searching for nearby bus stops...');
+            }
+
+            // Execute Specialized Endpoint
+            result = await delegateToEndpoint(routeDecision, userLocation, userId);
+
+        } else {
+            // Full Pipeline with REAL OpenRouter Reasoning
+            send('reasoning', 'Understanding your question...');
+
+            const ctx: PipelineContext = {
+                userId,
+                query,
+                userLocation,
+                startTime: Date.now(),
+                hub: createCommunicationHub(),
+                agentResults: new Map(),
+                // Map-Action Pipeline: Include viewport state for spatial awareness
+                viewportState,
+                // Pass streaming callback so Layer5 can emit reasoning in real-time
+                streamReasoning: async (text: string) => {
+                    send('reasoning', text);
+                    await delay(100); // Small delay for UI animation
+                }
+            };
+
+            // Execute pipeline (this will call OpenRouter with reasoning enabled)
+            const pipelineResponse = await executePipeline(ctx);
+
+            // Extract reasoning details if available from context
+            reasoningDetails = (ctx as unknown as { reasoningDetails?: OpenRouterReasoningDetail[] }).reasoningDetails || [];
+
+            // Stream real reasoning steps to client
+            if (reasoningDetails.length > 0) {
+                console.log('[Streaming] Found', reasoningDetails.length, 'reasoning steps to stream');
+                for (const detail of reasoningDetails) {
+                    // OpenRouter uses 'reasoning.text' type with 'text' field
+                    const reasoningText = detail.text || detail.content || '';
+                    if (reasoningText && reasoningText.length > 10) {
+                        // Extract first sentence or limit length for readability
+                        const shortContent = reasoningText.split('.')[0].trim();
+                        if (shortContent.length > 10 && shortContent.length < 200) {
+                            send('reasoning', shortContent + '...');
+                            await delay(120); // Pace for readable animation
+                        } else if (reasoningText.length < 200) {
+                            send('reasoning', reasoningText);
+                            await delay(120);
+                        }
+                    }
+                }
+            } else {
+                // Fallback if no reasoning details available
+                console.log('[Streaming] No reasoning details, using fallback');
+                send('reasoning', 'Analyzing bus routes and schedules...');
+                await delay(200);
+                send('reasoning', 'Calculating optimal paths...');
+            }
+
+            // Format to DelegatedResponse shape
+            // Build map tool call if visualization would help (now async, delegates to get-map-data)
+            const mapToolCall = await buildMapToolCall(ctx);
+
+            result = {
+                success: true,
+                response: pipelineResponse,
+                intent: ctx.intent?.primaryIntent || 'GENERAL',
+                executionTimeMs: Date.now() - startTime,
+                routeData: ctx.bestRoute,
+                agentTrace: [],
+                reasoningDetails: reasoningDetails,
+                // Agentic tool calls - AI decides when to show map
+                toolCalls: mapToolCall ? [mapToolCall] : undefined,
+                // Map-Action Pipeline: AI-generated map commands
+                map_commands: ctx.mapCommands
+            };
+        }
+
+
+    } catch (e) {
+        console.error("Pipeline failure", e);
+        result = {
+            success: false,
+            response: "Sorry, I encountered a system error while processing.",
+            executionTimeMs: Date.now() - startTime,
+            agentTrace: []
+        };
+    }
+
+    // --- FINAL STEP: Send Result ---
+    send('reasoning', 'Finalizing response...');
+    await delay(100);
+    send('final_response', result);
+
+    // Close stream
+    controller.close();
+}
+
+// Helper for artificial delay to make reading possible
+function delay(ms: number) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}

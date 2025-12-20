@@ -26,6 +26,7 @@ import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
 import com.sahara.user.ui.components.SaharaTopBar
 import com.sahara.user.ui.theme.SaharaOrange
+import com.sahara.user.ui.components.CollapsibleThinkingCard
 import com.sahara.user.ui.viewmodel.ChatViewModel
 import com.sahara.user.ui.viewmodel.ThinkingStep
 import kotlinx.coroutines.launch
@@ -81,6 +82,15 @@ fun ThinkingScreen(
                     if (message.isUser) {
                         UserMessageBubble(message.content)
                     } else {
+                        // Show collapsible thinking card above AI response (if has thinking steps)
+                        if (message.thinkingSteps.isNotEmpty()) {
+                            CollapsibleThinkingCard(
+                                steps = message.thinkingSteps,
+                                isThinking = false,
+                                thinkingDurationMs = message.thinkingDurationMs
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                        }
                         AgentMessageBubble(message.content)
                     }
                 }
@@ -88,12 +98,14 @@ fun ThinkingScreen(
                 // Render "Thinking" Block if loading
                 if (isLoading) {
                     item {
-                        Spacer(modifier = Modifier.height(16.dp))
-                        ThinkingProcessBlock(thinkingSteps)
+                         Spacer(modifier = Modifier.height(16.dp))
+                         // Collapsible thinking card in active state
+                         CollapsibleThinkingCard(
+                             steps = thinkingSteps.map { it.description },
+                             isThinking = true,
+                             thinkingDurationMs = 0
+                         )
                     }
-                } else if (messages.isNotEmpty() && !messages.last().isUser) {
-                    // Optionally show collapsed thinking for the last AI response
-                    // For now, let's keep it clean as requested.
                 }
             }
 
@@ -159,81 +171,7 @@ fun AgentMessageBubble(text: String) {
 /**
  * The "Deep Reference Box" for Thinking Process
  */
-@Composable
-fun ThinkingProcessBlock(steps: List<ThinkingStep>) {
-    var expanded by remember { mutableStateOf(true) }
-    
-    // Animate height or just toggle visibility
-    Column(
-        modifier = Modifier.fillMaxWidth()
-    ) {
-        // Header
-        Row(
-            modifier = Modifier
-                .clickable { expanded = !expanded }
-                .padding(bottom = 8.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(
-                text = "Thinking Process...",
-                style = MaterialTheme.typography.labelLarge,
-                color = Color.Gray
-            )
-            Spacer(modifier = Modifier.width(8.dp))
-            Icon(
-                if (expanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
-                contentDescription = null,
-                tint = Color.Gray,
-                modifier = Modifier.size(16.dp)
-            )
-        }
 
-        if (expanded) {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .border(1.dp, Color.LightGray, RoundedCornerShape(12.dp))
-                    .padding(16.dp)
-            ) {
-                Column {
-                    steps.forEach { step ->
-                        ThinkingProcessItem(step)
-                        Spacer(modifier = Modifier.height(8.dp))
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-fun ThinkingProcessItem(step: ThinkingStep) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        // Checkbox or Loading Spinner
-        if (step.isActive && !step.isComplete) {
-            CircularProgressIndicator(
-                modifier = Modifier.size(16.dp),
-                strokeWidth = 2.dp,
-                color = SaharaOrange
-            )
-        } else {
-            Icon(
-                Icons.Default.Check,
-                contentDescription = null,
-                modifier = Modifier.size(16.dp),
-                tint = if (step.isComplete) SaharaOrange else Color.Gray
-            )
-        }
-        
-        Spacer(modifier = Modifier.width(12.dp))
-        
-        Text(
-            text = step.description,
-            style = MaterialTheme.typography.bodyMedium,
-            color = if (step.isActive || step.isComplete) Color.Black else Color.Gray
-        )
-    }
-}
 
 @Composable
 fun ChatInputArea(

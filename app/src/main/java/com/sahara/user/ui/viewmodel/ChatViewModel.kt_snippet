@@ -1,0 +1,29 @@
+    private fun generateThinkingSteps(query: String): List<ThinkingStep> {
+        val lowerQuery = query.lowercase()
+        val steps = mutableListOf<ThinkingStep>()
+        
+        steps.add(ThinkingStep("Analyzing request...", isActive = true))
+        
+        // Context-aware steps
+        if (lowerQuery.contains("traffic") || lowerQuery.contains("jam") || lowerQuery.contains("late")) {
+            steps.add(ThinkingStep("⟳ Checking live traffic on major routes..."))
+            steps.add(ThinkingStep("⚠ Analyzing congestion patterns near stops..."))
+        }
+        
+        if (lowerQuery.contains("rain") || lowerQuery.contains("weather") || lowerQuery.contains("umbrella")) {
+            steps.add(ThinkingStep("☂️ Checking weather forecast..."))
+            steps.add(ThinkingStep("Checking sheltered walking paths..."))
+        }
+
+        if (lowerQuery.contains("bus") || lowerQuery.contains("stop") || lowerQuery.contains("schedule")) {
+             steps.add(ThinkingStep("Scanning nearby bus stops..."))
+             steps.add(ThinkingStep("Fetching real-time vehicle positions..."))
+        }
+        
+        // General agent steps
+        steps.add(ThinkingStep("Calculating optimal routes..."))
+        steps.add(ThinkingStep("Verifying arrival times..."))
+        steps.add(ThinkingStep("✓ Found optimal solution."))
+        
+        return steps
+    }

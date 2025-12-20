@@ -5,12 +5,13 @@ import com.sahara.user.data.api.AgentApiClient
 import com.sahara.user.data.api.NearbyStop
 import com.sahara.user.data.api.NearbyStopsResponse
 import com.sahara.user.data.api.ProcessQueryResponse
-import com.sahara.user.data.api.RouteData
 import com.sahara.user.data.api.TrackBusResponse
 import com.sahara.user.service.LocationService
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.serialization.json.JsonElement
+import com.sahara.user.data.model.ViewportState
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -42,8 +43,9 @@ class AgentRepository @Inject constructor(
     private val _lastResponse = MutableStateFlow<ProcessQueryResponse?>(null)
     val lastResponse: StateFlow<ProcessQueryResponse?> = _lastResponse.asStateFlow()
     
-    private val _lastRouteData = MutableStateFlow<RouteData?>(null)
-    val lastRouteData: StateFlow<RouteData?> = _lastRouteData.asStateFlow()
+    // Use JsonElement for flexible routeData shapes (find-route vs nearby-stops)
+    private val _lastRouteData = MutableStateFlow<JsonElement?>(null)
+    val lastRouteData: StateFlow<JsonElement?> = _lastRouteData.asStateFlow()
     
     // ==================== MAIN METHODS ====================
     
@@ -122,6 +124,42 @@ class AgentRepository @Inject constructor(
             Result.failure(e)
         } finally {
             _isProcessing.value = false
+        }
+    }
+    
+    /**
+     * Process query with REAL-TIME streaming of reasoning tokens.
+     * Returns a Flow that emits events as they arrive from the server.
+     * 
+     * @param viewportState Current map viewport for spatial-aware queries (Map-Action Pipeline)
+     */
+    fun processQueryStreaming(
+        userId: String,
+        query: String,
+        userLat: Double? = null,
+        userLng: Double? = null,
+        viewportState: ViewportState? = null
+    ): kotlinx.coroutines.flow.Flow<AgentApiClient.StreamEvent> {
+        Log.d(TAG, "Starting streaming query: $query (viewport=${viewportState != null})")
+        _isProcessing.value = true
+        
+        return agentApiClient.processQueryStreaming(
+            userId = userId,
+            query = query,
+            latitude = userLat,
+            longitude = userLng,
+            viewportState = viewportState
+        )
+    }
+    
+    /**
+     * Mark processing as complete (call after stream ends).
+     */
+    fun markProcessingComplete(response: com.sahara.user.data.api.ProcessQueryResponse? = null) {
+        _isProcessing.value = false
+        if (response != null) {
+            _lastResponse.value = response
+            _lastRouteData.value = response.routeData
         }
     }
     

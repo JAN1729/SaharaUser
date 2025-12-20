@@ -21,6 +21,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
+import com.sahara.user.ui.components.RouteMapCard
 import com.sahara.user.ui.viewmodel.ChatViewModel
 import com.sahara.user.ui.viewmodel.ThinkingStep
 import com.sahara.user.ui.viewmodel.AgentStatus
@@ -47,6 +48,9 @@ fun ChatScreen(
     val thinkingSteps by viewModel.thinkingSteps.collectAsState()
     val agentStatus by viewModel.agentStatus.collectAsState()
     val agentPipeline by viewModel.agentPipeline.collectAsState()
+    
+    // AGENTIC: Ephemeral map tool from AI
+    val activeMapTool by viewModel.activeMapTool.collectAsState()
     
     var inputText by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
@@ -126,6 +130,38 @@ fun ChatScreen(
                         agentStatus = agentStatus,
                         agentPipeline = agentPipeline
                     )
+                }
+            }
+            
+            // AGENTIC: Ephemeral Map Tool - appears when AI invokes it
+            item {
+                AnimatedVisibility(
+                    visible = activeMapTool != null,
+                    enter = slideInVertically(
+                        initialOffsetY = { it / 2 },
+                        animationSpec = tween(durationMillis = 300, easing = FastOutSlowInEasing)
+                    ) + fadeIn(animationSpec = tween(300)),
+                    exit = slideOutVertically(
+                        targetOffsetY = { it / 2 },
+                        animationSpec = tween(durationMillis = 200)
+                    ) + fadeOut(animationSpec = tween(200))
+                ) {
+                    activeMapTool?.let { mapData ->
+                        val mapCommands by viewModel.pendingMapCommands.collectAsState()
+                        
+                        RouteMapCard(
+                            data = mapData,
+                            modifier = Modifier.padding(vertical = 8.dp),
+                            mapCommands = mapCommands,
+                            onViewportChanged = { north, south, east, west, zoom ->
+                                viewModel.updateViewportState(north, south, east, west, zoom)
+                            },
+                            onCommandsExecuted = {
+                                viewModel.clearMapCommands()
+                            },
+                            onDismiss = { viewModel.clearMapTool() }
+                        )
+                    }
                 }
             }
             
@@ -560,5 +596,7 @@ data class ChatMessage(
     val id: String,
     val content: String,
     val isUser: Boolean,
-    val metadata: Map<String, String>? = null
+    val metadata: Map<String, String>? = null,
+    val thinkingSteps: List<String> = emptyList(),
+    val thinkingDurationMs: Long = 0
 )
