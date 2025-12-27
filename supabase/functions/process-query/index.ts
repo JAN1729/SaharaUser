@@ -303,7 +303,7 @@ interface UserLocation {
 
 // Analyzed Intent with subdividing (Layer 1 output)
 interface AnalyzedIntent {
-    primaryIntent: 'FIND_ROUTE' | 'TRACK_BUS' | 'FIND_NEARBY' | 'GENERAL';
+    primaryIntent: 'FIND_ROUTE' | 'TRACK_BUS' | 'FIND_NEARBY' | 'GENERAL' | 'FIND_KSRTC_ROUTE';
     subIntents: string[];
     entities: {
         origin?: string;
@@ -314,6 +314,45 @@ interface AnalyzedIntent {
     };
     confidence: number;
     reasoning: string;
+}
+
+// ========================
+// KSRTC API Integration
+// ========================
+interface KSRTCCity {
+    id: string;
+    name: string;
+    toCities: Map<string, string>; // destinationId -> destinationName
+}
+
+interface KSRTCRoute {
+    routeId: string;
+    departureTime: string;   // ISO format
+    arrivalTime: string;     // ISO format
+    serviceType: string;     // "SUPER FAST", "AC MULTI AXLE", etc.
+    busType: string;         // "Deluxe" or empty
+    routeName: string;       // "Trivandrum - Ernakulam"
+    tripCode: string;        // "1430TVMPLNI"
+    availableSeats: number;
+    hasAC: boolean;
+}
+
+// Raw API response types
+interface KSRTCCityRaw {
+    ToCities: Record<string, string>;
+    Name: string;
+}
+
+interface KSRTCRouteRaw {
+    RouteScheduleId: string;
+    DepartureTime: string;
+    ArrivalTime: string;
+    ServiceType: string;
+    BusType: string;
+    RouteName: string;
+    TripCode: string;
+    AvailableSeats: number;
+    HasAC: number;
 }
 
 // Filtered stop within 3km (Layer 2/3 output)
@@ -491,6 +530,9 @@ interface PipelineContext {
     // Streaming callback for real-time reasoning display
     streamReasoning?: (text: string) => Promise<void>;
 
+    // Agent Trace - lightweight A2A visibility
+    agentTrace: AgentTraceEntry[];
+
     // Layer outputs
     intent?: AnalyzedIntent;
     filteredStops?: FilteredStop[];
@@ -534,6 +576,31 @@ interface PipelineContext {
         buses: Array<{ bus_id: string; vehicle_name: string; latitude: number; longitude: number }>;
         stops: Array<{ id: string; name: string; latitude: number; longitude: number }>;
     };
+
+    // KSRTC Specific Data
+    ksrtcRoutes?: KSRTCRoute[];
+    ksrtcOrigin?: string;
+    ksrtcDestination?: string;
+}
+
+// Agent Trace Entry - lightweight A2A visibility
+interface AgentTraceEntry {
+    agent: string;
+    action: string;
+    durationMs: number;
+    success: boolean;
+    timestamp: number;
+}
+
+// Helper to add an agent trace entry
+function addAgentTrace(ctx: PipelineContext, agent: string, action: string, durationMs: number, success: boolean): void {
+    ctx.agentTrace.push({
+        agent,
+        action,
+        durationMs,
+        success,
+        timestamp: Date.now()
+    });
 }
 
 interface MemoryContext {
@@ -573,6 +640,192 @@ function haversineDistance(lat1: number, lng1: number, lat2: number, lng2: numbe
 
     const a = Math.sin(Δφ / 2) ** 2 + Math.cos(φ1) * Math.cos(φ2) * Math.sin(Δλ / 2) ** 2;
     return EARTH_RADIUS_KM * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+// ============================================================================
+// KSRTC API HELPERS & CACHE
+// ============================================================================
+
+// KSRTC City Cache - 24 hour TTL
+let ksrtcCityCache: Map<string, KSRTCCity> = new Map();
+let ksrtcCityCacheTime = 0;
+const KSRTC_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
+
+// Fetch and cache KSRTC cities
+async function getKSRTCCities(): Promise<Map<string, KSRTCCity>> {
+    const now = Date.now();
+    if (ksrtcCityCache.size > 0 && (now - ksrtcCityCacheTime) < KSRTC_CACHE_TTL) {
+        return ksrtcCityCache;
+    }
+
+    try {
+        const response = await fetch('https://assets.onlineksrtcswift.com/api/resource/getCities');
+        if (!response.ok) throw new Error(`KSRTC Cities API error: ${response.status}`);
+
+        const data: Record<string, KSRTCCityRaw> = await response.json();
+        const cities = new Map<string, KSRTCCity>();
+
+        for (const [id, city] of Object.entries(data)) {
+            cities.set(id, {
+                id,
+                name: city.Name,
+                toCities: new Map(Object.entries(city.ToCities))
+            });
+        }
+
+        ksrtcCityCache = cities;
+        ksrtcCityCacheTime = now;
+        console.log(`[KSRTC] Cached ${cities.size} cities`);
+        return cities;
+    } catch (error) {
+        console.error('[KSRTC] Failed to fetch cities:', error);
+        return ksrtcCityCache; // Return stale cache if available
+    }
+}
+
+// Find city by name (fuzzy match)
+function findKSRTCCity(cities: Map<string, KSRTCCity>, name: string): KSRTCCity | null {
+    if (!name) return null;
+    const normalized = name.toLowerCase().trim();
+
+    for (const city of cities.values()) {
+        if (city.name.toLowerCase() === normalized) return city;
+        // Common aliases
+        if (normalized === 'kochi' && city.name.toLowerCase() === 'ernakulam') return city;
+        if (normalized === 'tvm' && city.name.toLowerCase() === 'trivandrum') return city;
+        if (normalized === 'ekm' && city.name.toLowerCase() === 'ernakulam') return city;
+        if (normalized === 'kozhikkode' && city.name.toLowerCase() === 'kozhikode') return city;
+    }
+
+    // Partial match
+    for (const city of cities.values()) {
+        if (city.name.toLowerCase().includes(normalized) ||
+            normalized.includes(city.name.toLowerCase())) {
+            return city;
+        }
+    }
+
+    return null;
+}
+
+// Search KSRTC routes
+async function searchKSRTCRoutes(
+    fromCityId: string,
+    toCityId: string,
+    fromCityName: string,
+    toCityName: string,
+    journeyDate?: string
+): Promise<KSRTCRoute[]> {
+    const date = journeyDate || new Date().toISOString().split('T')[0];
+
+    const url = new URL('https://onlineksrtcswift.com/api/resource/searchRoutesV4');
+    url.searchParams.set('fromCityID', fromCityId);
+    url.searchParams.set('toCityID', toCityId);
+    url.searchParams.set('fromCityName', fromCityName);
+    url.searchParams.set('toCityName', toCityName);
+    url.searchParams.set('journeyDate', date);
+    url.searchParams.set('mode', 'oneway');
+
+    console.log(`[KSRTC] Searching routes: ${fromCityName} to ${toCityName} on ${date}`);
+
+    try {
+        const response = await fetch(url.toString());
+        if (!response.ok) throw new Error(`KSRTC Routes API error: ${response.status}`);
+
+        const rawRoutes: KSRTCRouteRaw[] = await response.json();
+
+        if (!Array.isArray(rawRoutes)) {
+            console.warn('[KSRTC] Unexpected response format (not an array)');
+            return [];
+        }
+
+        // Transform and filter - only extract needed fields
+        return rawRoutes.map(r => ({
+            routeId: r.RouteScheduleId,
+            departureTime: r.DepartureTime,
+            arrivalTime: r.ArrivalTime,
+            serviceType: r.ServiceType,
+            busType: r.BusType || '',
+            routeName: r.RouteName,
+            tripCode: r.TripCode,
+            availableSeats: r.AvailableSeats,
+            hasAC: r.HasAC === 1
+        })).sort((a, b) =>
+            new Date(a.departureTime).getTime() - new Date(b.departureTime).getTime()
+        );
+    } catch (error) {
+        console.error('[KSRTC] Failed to search routes:', error);
+        return [];
+    }
+}
+
+// KSRTC Agent Function
+async function findKSRTCRoutes(ctx: PipelineContext): Promise<AgentOutput> {
+    const startTime = Date.now();
+
+    const origin = ctx.intent?.entities?.origin;
+    const destination = ctx.intent?.entities?.destination;
+
+    if (!origin || !destination) {
+        return {
+            success: false,
+            agentName: 'KSRTCAgent',
+            executionTimeMs: Date.now() - startTime,
+            error: 'Missing origin or destination for KSRTC route search',
+            data: {},
+            confidence: 0
+        };
+    }
+
+    try {
+        const cities = await getKSRTCCities();
+        const originCity = findKSRTCCity(cities, origin);
+        const destCity = findKSRTCCity(cities, destination);
+
+        if (!originCity || !destCity) {
+            return {
+                success: false,
+                agentName: 'KSRTCAgent',
+                executionTimeMs: Date.now() - startTime,
+                error: `Could not find KSRTC city: ${!originCity ? origin : destination}`,
+                data: {},
+                confidence: 0.1
+            };
+        }
+
+        // Check if destination is valid from origin
+        if (!originCity.toCities.has(destCity.id)) {
+            console.log(`[KSRTCAgent] No direct direct KSRTC route recorded from ${originCity.name} to ${destCity.name} in city's ToCities list, but searching anyway as fallback.`);
+        }
+
+        const routes = await searchKSRTCRoutes(
+            originCity.id,
+            destCity.id,
+            originCity.name,
+            destCity.name
+        );
+
+        ctx.ksrtcRoutes = routes;
+        ctx.ksrtcOrigin = originCity.name;
+        ctx.ksrtcDestination = destCity.name;
+
+        return {
+            success: true,
+            agentName: 'KSRTCAgent',
+            executionTimeMs: Date.now() - startTime,
+            data: { routeCount: routes.length },
+            confidence: routes.length > 0 ? 0.9 : 0.5
+        };
+    } catch (error) {
+        return {
+            success: false,
+            agentName: 'KSRTCAgent',
+            executionTimeMs: Date.now() - startTime,
+            error: `KSRTC API error: ${error}`,
+            data: {},
+            confidence: 0
+        };
+    }
 }
 
 /**
@@ -676,13 +929,15 @@ function extractVehicleReference(query: string): string | null {
 const INTENT_ANALYSIS_PROMPT = `You are the Sahara Bus AI intent analyzer. Analyze the user's query comprehensively.
 
 INTENTS (in order of priority):
-1. FIND_ROUTE - User wants to travel from A to B
+1. FIND_KSRTC_ROUTE - User specifically asks for KSRTC or Kerala state buses
+   Keywords: "KSRTC", "Kerala Swift", "Kerala State bus", "Swift bus"
+2. FIND_ROUTE - User wants to travel from A to B (General)
    Keywords: "to", "from", "go", "reach", "get to", "travel", "how do I", "bus to", two locations
-2. TRACK_BUS - User wants to find/track a specific bus
+3. TRACK_BUS - User wants to find/track a specific bus
    Keywords: "where is", "track", "find bus", "locate", bus name/number
-3. FIND_NEARBY - User wants stops/buses near their location
+4. FIND_NEARBY - User wants stops/buses near their location
    Keywords: "nearby", "near me", "closest", "around here"
-4. GENERAL - Pure greetings only ("hi", "hello", "help")
+5. GENERAL - Pure greetings only ("hi", "hello", "help")
 
 SPATIAL GROUNDING (Map-Action Pipeline):
 - If the user says "What is that?", "that bus", "the red one", "this stop" → they are referring to something ON THEIR SCREEN
@@ -713,8 +968,64 @@ OUTPUT (JSON only):
 } Setting showMap to true is CRITICAL for map-worthy queries.
 `;
 
+/**
+ * Safely extract and parse JSON from AI response
+ * Handles: markdown code blocks, preamble text, trailing garbage
+ * @returns Parsed object or null if extraction fails
+ */
+function safeExtractJSON<T>(content: string): { success: boolean; data?: T; error?: string } {
+    if (!content || content.trim().length === 0) {
+        return { success: false, error: 'Empty content' };
+    }
+
+    // Strategy 1: Try direct parse (content is already pure JSON)
+    try {
+        const parsed = JSON.parse(content.trim()) as T;
+        return { success: true, data: parsed };
+    } catch { /* Continue to other strategies */ }
+
+    // Strategy 2: Extract from markdown code blocks (```json ... ``` or ``` ... ```)
+    const codeBlockMatch = content.match(/```(?:json)?\s*([\s\S]*?)```/);
+    if (codeBlockMatch && codeBlockMatch[1]) {
+        try {
+            const parsed = JSON.parse(codeBlockMatch[1].trim()) as T;
+            return { success: true, data: parsed };
+        } catch { /* Continue */ }
+    }
+
+    // Strategy 3: Find JSON object by matching { ... } with balanced braces
+    const firstBrace = content.indexOf('{');
+    const lastBrace = content.lastIndexOf('}');
+    if (firstBrace !== -1 && lastBrace > firstBrace) {
+        const jsonCandidate = content.substring(firstBrace, lastBrace + 1);
+        try {
+            const parsed = JSON.parse(jsonCandidate) as T;
+            return { success: true, data: parsed };
+        } catch { /* Continue */ }
+    }
+
+    // Strategy 4: Try to fix common JSON issues (unescaped quotes, trailing commas)
+    let cleaned = content
+        .replace(/,\s*}/g, '}')  // Remove trailing commas before }
+        .replace(/,\s*]/g, ']')  // Remove trailing commas before ]
+        .replace(/[\x00-\x1F\x7F]/g, ' '); // Remove control characters
+
+    // Try extracting JSON object from cleaned content
+    const cleanedFirstBrace = cleaned.indexOf('{');
+    const cleanedLastBrace = cleaned.lastIndexOf('}');
+    if (cleanedFirstBrace !== -1 && cleanedLastBrace > cleanedFirstBrace) {
+        try {
+            const parsed = JSON.parse(cleaned.substring(cleanedFirstBrace, cleanedLastBrace + 1)) as T;
+            return { success: true, data: parsed };
+        } catch { /* Final failure */ }
+    }
+
+    return { success: false, error: `Could not extract valid JSON from: ${content.substring(0, 100)}...` };
+}
+
 // Fallback patterns for deterministic intent analysis
 const INTENT_PATTERNS = [
+    { pattern: /ksrtc|kerala\s*state.*bus/i, intent: 'FIND_KSRTC_ROUTE' as const, priority: 11 },
     { pattern: /(?:from|at)\s+(.+?)\s+(?:to|towards?)\s+(.+)/i, intent: 'FIND_ROUTE' as const, priority: 10 },
     { pattern: /(.+?)\s+to\s+(.+)/i, intent: 'FIND_ROUTE' as const, priority: 9 },
     { pattern: /(?:how|can|do)\s+(?:i|we)\s+(?:get|go|reach|travel)/i, intent: 'FIND_ROUTE' as const, priority: 8 },
@@ -1117,9 +1428,9 @@ List any additional routes briefly.
 - Can suggest checking nearby stops IF they are in the data
 
 ## INDICATORS
-🚌 = bus | 📍 = stop | ⏱️ = time | 🚶 = walk | 🟢 = live | 🔴 = offline
+🚌 = bus | 📍 = stop | ⏱️ = time | 🚶 = walk | 🟢 = live | 🔴 = offline | 🌊 = KSRTC Swift
 
-Remember: If it's NOT in the PROVIDED DATA below, you CANNOT mention it.`;
+Remember: If it's NOT in the PROVIDED DATA below, you CANNOT mention it. Highlight KSRTC Swift (Kerala State RTC) buses clearly as they are premium inter-city options.`;
 
 
 async function generateGroundedResponse(
@@ -1177,10 +1488,53 @@ async function generateGroundedResponse(
         // Summary stats
         const totalDirectRoutes = ctx.allRoutes?.length || 0;
         const totalTransferRoutes = ctx.multiHopRoutes?.length || 0;
-        if (totalDirectRoutes === 0 && totalTransferRoutes === 0) {
-            groundedData.push(`\n⚠️ NO ROUTES FOUND in database for this journey.`);
+        const totalKSRTCRoutes = ctx.ksrtcRoutes?.length || 0;
+
+        if (totalDirectRoutes === 0 && totalTransferRoutes === 0 && totalKSRTCRoutes === 0) {
+            groundedData.push(`\n⚠️ NO ROUTES FOUND in database or KSRTC for this journey.`);
         } else {
-            groundedData.push(`\n📊 SUMMARY: ${totalDirectRoutes} direct routes, ${totalTransferRoutes} transfer routes found`);
+            groundedData.push(`\n📊 SUMMARY: ${totalDirectRoutes} direct routes, ${totalTransferRoutes} transfer routes, ${totalKSRTCRoutes} KSRTC routes found`);
+        }
+    }
+
+    // ========================================
+    // KSRTC ROUTE DATA (Kerala State RTC)
+    // ========================================
+    if (ctx.ksrtcRoutes && ctx.ksrtcRoutes.length > 0) {
+        groundedData.push(`\n🌊 KSRTC SWIFT ROUTES (Kerala State RTC):`);
+        groundedData.push(`   Journey: ${ctx.ksrtcOrigin} → ${ctx.ksrtcDestination}`);
+        groundedData.push(`   Total Buses: ${ctx.ksrtcRoutes.length} (showing top options)\n`);
+
+        // Show up to 10 routes for variety
+        ctx.ksrtcRoutes.slice(0, 10).forEach((route, i) => {
+            const dep = new Date(route.departureTime);
+            const arr = new Date(route.arrivalTime);
+
+            // Indian Timezone (IST) formatting
+            const timeOptions: Intl.DateTimeFormatOptions = {
+                hour: '2-digit',
+                minute: '2-digit',
+                hour12: true,
+                timeZone: 'Asia/Kolkata'
+            };
+
+            const depStr = dep.toLocaleTimeString('en-IN', timeOptions);
+            const arrStr = arr.toLocaleTimeString('en-IN', timeOptions);
+
+            const durationMs = arr.getTime() - dep.getTime();
+            const hours = Math.floor(durationMs / (1000 * 60 * 60));
+            const mins = Math.floor((durationMs % (1000 * 60 * 60)) / (1000 * 60));
+
+            groundedData.push(`  ${i + 1}. "${route.serviceType}" ${route.hasAC ? '🟢 AC' : '⚪ NAC'}`);
+            groundedData.push(`     Route: ${route.routeName}`);
+            groundedData.push(`     Schedule: ${depStr} → ${arrStr} (${hours}h ${mins}m)`);
+            groundedData.push(`     Seats Available: ${route.availableSeats}`);
+            groundedData.push(`     Trip Code: ${route.tripCode}`);
+            if (route.busType) groundedData.push(`     Bus Model: ${route.busType}`);
+        });
+
+        if (ctx.ksrtcRoutes.length > 10) {
+            groundedData.push(`  ... and ${ctx.ksrtcRoutes.length - 10} more inter-city schedules available.`);
         }
     }
 
@@ -2950,8 +3304,8 @@ interface DelegatedResponse {
     intent: string;
     routeData?: Record<string, unknown>;
     executionTimeMs: number;
-    // Add agentTrace to match Android ProcessQueryResponse model
-    agentTrace: Array<{ type: string; message: string; timestamp: number }>;
+    // Agent trace for A2A visibility
+    agentTrace: AgentTraceEntry[];
 }
 
 /**
@@ -3161,7 +3515,7 @@ async function delegateToEndpoint(
                         freshness: result.freshness
                     } : undefined,
                     executionTimeMs: Date.now() - startTime,
-                    agentTrace: [{ type: 'AGENT', message: 'track-bus agent completed', timestamp: Date.now() }]
+                    agentTrace: [{ agent: 'TrackerAgent', action: 'track_bus', durationMs: Date.now() - startTime, success: result.success === true, timestamp: Date.now() }]
                 };
             } catch (error) {
                 // Fallback to internal if Edge Function fails
@@ -3179,7 +3533,7 @@ async function delegateToEndpoint(
                         nearestStop: result.nearestStop
                     } : undefined,
                     executionTimeMs: Date.now() - startTime,
-                    agentTrace: [{ type: 'AGENT', message: 'track-bus (internal fallback)', timestamp: Date.now() }]
+                    agentTrace: [{ agent: 'TrackerAgent', action: 'track_bus_fallback', durationMs: Date.now() - startTime, success: result.success, timestamp: Date.now() }]
                 };
             }
         }
@@ -3219,7 +3573,7 @@ async function delegateToEndpoint(
                     intent: 'FIND_ROUTE',
                     routeData: result.bestRoute as Record<string, unknown>,
                     executionTimeMs: Date.now() - startTime,
-                    agentTrace: [{ type: 'AGENT', message: 'find-route agent completed', timestamp: Date.now() }]
+                    agentTrace: [{ agent: 'RouteAgent', action: 'find_route', durationMs: Date.now() - startTime, success: result.success === true, timestamp: Date.now() }]
                 };
             } catch (error) {
                 // Fallback to internal if Edge Function fails
@@ -3235,7 +3589,7 @@ async function delegateToEndpoint(
                     intent: 'FIND_ROUTE',
                     routeData: result.bestRoute as Record<string, unknown>,
                     executionTimeMs: Date.now() - startTime,
-                    agentTrace: [{ type: 'AGENT', message: 'find-route (internal fallback)', timestamp: Date.now() }]
+                    agentTrace: [{ agent: 'RouteAgent', action: 'find_route_fallback', durationMs: Date.now() - startTime, success: result.success, timestamp: Date.now() }]
                 };
             }
         }
@@ -3248,7 +3602,7 @@ async function delegateToEndpoint(
                     response: 'Please share your location to find nearby stops.',
                     intent: 'FIND_NEARBY',
                     executionTimeMs: Date.now() - startTime,
-                    agentTrace: [{ type: 'ERROR', message: 'User location required', timestamp: Date.now() }]
+                    agentTrace: [{ agent: 'NearbyStopsAgent', action: 'location_required', durationMs: Date.now() - startTime, success: false, timestamp: Date.now() }]
                 };
             }
 
@@ -3283,7 +3637,7 @@ async function delegateToEndpoint(
                     intent: 'FIND_NEARBY',
                     routeData: { stops: result.stops, count: result.count },
                     executionTimeMs: Date.now() - startTime,
-                    agentTrace: [{ type: 'AGENT', message: 'get-nearby-stops agent completed', timestamp: Date.now() }]
+                    agentTrace: [{ agent: 'NearbyStopsAgent', action: 'find_nearby', durationMs: Date.now() - startTime, success: result.success === true, timestamp: Date.now() }]
                 };
             } catch (error) {
                 // Fallback to internal
@@ -3299,7 +3653,7 @@ async function delegateToEndpoint(
                     intent: 'FIND_NEARBY',
                     routeData: { stops: result.stops, count: result.count },
                     executionTimeMs: Date.now() - startTime,
-                    agentTrace: [{ type: 'AGENT', message: 'get-nearby-stops (internal fallback)', timestamp: Date.now() }]
+                    agentTrace: [{ agent: 'NearbyStopsAgent', action: 'find_nearby_fallback', durationMs: Date.now() - startTime, success: result.success, timestamp: Date.now() }]
                 };
             }
         }
@@ -4081,7 +4435,10 @@ async function executePipeline(ctx: PipelineContext): Promise<string> {
     // LAYER 1: AI Intent Analysis
     // ========================================
     console.log('[Layer1] Analyzing intent...');
+    const intentStart = Date.now();
     ctx.intent = await analyzeIntentWithAI(ctx.query);
+    const intentDuration = Date.now() - intentStart;
+    addAgentTrace(ctx, 'IntentAgent', ctx.intent.primaryIntent, intentDuration, true);
     console.log(`[Layer1] Intent: ${ctx.intent.primaryIntent} (${Math.round(ctx.intent.confidence * 100)}%)`);
 
     // Publish INTENT_ANALYZED via hub
@@ -4108,7 +4465,10 @@ async function executePipeline(ctx: PipelineContext): Promise<string> {
     // DATA AGENT: Fetch LATEST data
     // ========================================
     console.log('[DataAgent] Fetching latest data...');
+    const dataStart = Date.now();
     const dataResult = await fetchLatestData(ctx);
+    const dataDuration = Date.now() - dataStart;
+    addAgentTrace(ctx, 'DataAgent', 'fetch_data', dataDuration, dataResult.success);
     ctx.agentResults.set('DataAgent', dataResult);
 
     // Publish DATA_READY via hub
@@ -4134,7 +4494,10 @@ async function executePipeline(ctx: PipelineContext): Promise<string> {
     // MEMORY AGENT: RAG context retrieval
     // ========================================
     console.log('[MemoryAgent] Retrieving context...');
+    const memoryStart = Date.now();
     const memoryResult = await retrieveMemoryContext(ctx);
+    const memoryDuration = Date.now() - memoryStart;
+    addAgentTrace(ctx, 'MemoryAgent', 'retrieve_context', memoryDuration, memoryResult.success);
     ctx.agentResults.set('MemoryAgent', memoryResult);
 
     // ========================================
@@ -4176,33 +4539,50 @@ async function executePipeline(ctx: PipelineContext): Promise<string> {
         console.log(`[Layer4] Found ${ctx.filteredBuses.length} buses passing through selected stops`);
     }
 
+    // = [NEW] KSRTC AGENT PRE-WARM =
+    // Pre-fetch cities in background if not cached
+    getKSRTCCities().catch(() => { });
+
     // ========================================
     // INTENT-SPECIFIC AGENTS (PARALLEL for FIND_ROUTE)
     // ========================================
     switch (ctx.intent.primaryIntent) {
+        case 'FIND_KSRTC_ROUTE':
         case 'FIND_ROUTE':
             // ========================================
             // PHASE 2: PARALLEL Route Discovery
-            // Run direct routes + multi-hop routes simultaneously
+            // Run direct routes + multi-hop routes + KSRTC routes simultaneously
             // ========================================
             console.log('[RouteDiscovery] Running parallel route agents...');
             const routeDiscoveryStart = Date.now();
 
-            const [routeResult, multiHopResult] = await Promise.all([
+            const discoveries: Promise<AgentOutput>[] = [
                 findRoutes(ctx),
-                findMultiHopRoutes(ctx)
-            ]);
+                findMultiHopRoutes(ctx),
+                findKSRTCRoutes(ctx)
+            ];
+
+            const [routeResult, multiHopResult, ksrtcResult] = await Promise.all(discoveries);
+
+            const routeDiscoveryDuration = Date.now() - routeDiscoveryStart;
+            addAgentTrace(ctx, 'RouteAgent', 'find_routes', routeResult.executionTimeMs || 0, routeResult.success);
+            addAgentTrace(ctx, 'MultiHopRouteAgent', 'find_transfers', multiHopResult.executionTimeMs || 0, multiHopResult.success);
+            addAgentTrace(ctx, 'KSRTCAgent', 'search_ksrtc', ksrtcResult.executionTimeMs || 0, ksrtcResult.success);
 
             ctx.agentResults.set('RouteAgent', routeResult);
             ctx.agentResults.set('MultiHopRouteAgent', multiHopResult);
+            ctx.agentResults.set('KSRTCAgent', ksrtcResult);
 
-            console.log(`[RouteDiscovery] Parallel phase complete in ${Date.now() - routeDiscoveryStart}ms`);
-            console.log(`[RouteDiscovery] Direct routes: ${ctx.allRoutes?.length || 0}, Multi-hop: ${ctx.multiHopRoutes?.length || 0}`);
+            console.log(`[RouteDiscovery] Parallel phase complete in ${routeDiscoveryDuration}ms`);
+            console.log(`[RouteDiscovery] Direct: ${ctx.allRoutes?.length || 0}, Multi-hop: ${ctx.multiHopRoutes?.length || 0}, KSRTC: ${ctx.ksrtcRoutes?.length || 0}`);
             break;
 
         case 'TRACK_BUS':
             console.log('[TrackerAgent] Tracking bus...');
+            const trackerStart = Date.now();
             const trackerResult = await trackBus(ctx);
+            const trackerDuration = Date.now() - trackerStart;
+            addAgentTrace(ctx, 'TrackerAgent', 'track_bus', trackerDuration, trackerResult.success);
             ctx.agentResults.set('TrackerAgent', trackerResult);
             break;
 
@@ -4233,9 +4613,12 @@ async function executePipeline(ctx: PipelineContext): Promise<string> {
     const enrichmentResults = await Promise.all(enrichmentPromises);
     enrichmentResults.forEach(result => {
         ctx.agentResults.set(result.agentName, result);
+        // Add trace for each enrichment agent
+        addAgentTrace(ctx, result.agentName, 'enrich', result.executionTimeMs, result.success);
     });
 
-    console.log(`[Enrichment] Parallel phase complete in ${Date.now() - enrichmentStart}ms`);
+    const enrichmentDuration = Date.now() - enrichmentStart;
+    console.log(`[Enrichment] Parallel phase complete in ${enrichmentDuration}ms`);
 
     // ========================================
     // MAP-ACTION PIPELINE: Viewport Entity Fetching
@@ -4264,7 +4647,10 @@ async function executePipeline(ctx: PipelineContext): Promise<string> {
     // LAYER 5: AI Response (Grounded)
     // ========================================
     console.log('[Layer5] Generating grounded response...');
+    const responseStart = Date.now();
     const response = await generateGroundedResponse(ctx.query, ctx);
+    const responseDuration = Date.now() - responseStart;
+    addAgentTrace(ctx, 'ResponseAgent', 'generate_response', responseDuration, response.length > 0);
 
     // ========================================
     // MAP-ACTION PIPELINE: Generate Map Commands
@@ -4412,6 +4798,7 @@ async function streamResponse(
                 startTime: Date.now(),
                 hub: createCommunicationHub(),
                 agentResults: new Map(),
+                agentTrace: [], // Initialize agent trace for A2A visibility
                 // Map-Action Pipeline: Include viewport state for spatial awareness
                 viewportState,
                 // Pass streaming callback so Layer5 can emit reasoning in real-time
@@ -4463,7 +4850,7 @@ async function streamResponse(
                 intent: ctx.intent?.primaryIntent || 'GENERAL',
                 executionTimeMs: Date.now() - startTime,
                 routeData: ctx.bestRoute,
-                agentTrace: [],
+                agentTrace: ctx.agentTrace, // Include agent execution trace
                 reasoningDetails: reasoningDetails,
                 // Agentic tool calls - AI decides when to show map
                 toolCalls: mapToolCall ? [mapToolCall] : undefined,
