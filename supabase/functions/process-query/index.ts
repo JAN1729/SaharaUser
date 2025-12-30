@@ -577,6 +577,14 @@ interface PipelineContext {
         stops: Array<{ id: string; name: string; latitude: number; longitude: number }>;
     };
 
+    // Geocoded origin location - when user specifies a "from" location in query
+    // This takes priority over userLocation for all layer calculations
+    geocodedOrigin?: {
+        latitude: number;
+        longitude: number;
+        placeName: string;
+    };
+
     // KSRTC Specific Data
     ksrtcRoutes?: KSRTCRoute[];
     ksrtcOrigin?: string;
@@ -640,6 +648,61 @@ function haversineDistance(lat1: number, lng1: number, lat2: number, lng2: numbe
 
     const a = Math.sin(Δφ / 2) ** 2 + Math.cos(φ1) * Math.cos(φ2) * Math.sin(Δλ / 2) ** 2;
     return EARTH_RADIUS_KM * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+// ============================================================================
+// GEOCODING: Convert place names to coordinates
+// ============================================================================
+
+/**
+ * Geocode a place name to coordinates using Mapbox Geocoding API.
+ * Used to find the "from" location when user specifies an origin in their query.
+ * 
+ * @param placeName - The place name to geocode (e.g., "MG Road", "Majestic")
+ * @returns Coordinates or null if geocoding fails
+ */
+async function geocodePlaceName(placeName: string): Promise<{ latitude: number; longitude: number } | null> {
+    const accessToken = Deno.env.get('MAPBOX_ACCESS_TOKEN');
+    if (!accessToken) {
+        console.warn('[Geocoding] MAPBOX_ACCESS_TOKEN not configured');
+        return null;
+    }
+
+    try {
+        // Bias search to Karnataka/Kerala/India region for better accuracy
+        // Southwest to Northeast bounding box
+        const bbox = '74.0,8.0,78.5,14.0';
+        const url = `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(placeName)}.json`;
+        const params = new URLSearchParams({
+            access_token: accessToken,
+            country: 'IN',
+            bbox: bbox,
+            limit: '1',
+            types: 'locality,neighborhood,place,address,poi'
+        });
+
+        console.log(`[Geocoding] Looking up: "${placeName}"`);
+        const response = await fetch(`${url}?${params}`);
+
+        if (!response.ok) {
+            console.warn(`[Geocoding] API error: ${response.status}`);
+            return null;
+        }
+
+        const data = await response.json();
+        if (data.features && data.features.length > 0) {
+            const feature = data.features[0];
+            const [lng, lat] = feature.center;
+            console.log(`[Geocoding] Found: "${feature.place_name}" at (${lat}, ${lng})`);
+            return { latitude: lat, longitude: lng };
+        }
+
+        console.log(`[Geocoding] No results for "${placeName}"`);
+        return null;
+    } catch (error) {
+        console.error('[Geocoding] Error:', error);
+        return null;
+    }
 }
 
 // ============================================================================
@@ -4501,13 +4564,52 @@ async function executePipeline(ctx: PipelineContext): Promise<string> {
     ctx.agentResults.set('MemoryAgent', memoryResult);
 
     // ========================================
-    // LAYER 2: Location Filter (3km Radius)
+    // GEOCODING: Convert "from" location to coordinates
+    // When user specifies an origin (e.g., "from MG Road to..."),
+    // geocode it and use those coordinates for all layer calculations
     // ========================================
-    if (ctx.userLocation && ctx.allStops && ctx.vehicles) {
-        console.log('[Layer2] Filtering stops within 3km...');
+    if (ctx.intent?.entities?.origin && ctx.intent.primaryIntent === 'FIND_ROUTE') {
+        const originName = ctx.intent.entities.origin;
+        console.log(`[Geocoding] Attempting to geocode origin: "${originName}"`);
+
+        const geocodingStart = Date.now();
+        const geocodedCoords = await geocodePlaceName(originName);
+        const geocodeDuration = Date.now() - geocodingStart;
+
+        if (geocodedCoords) {
+            ctx.geocodedOrigin = {
+                ...geocodedCoords,
+                placeName: originName
+            };
+            console.log(`[Geocoding] Origin "${originName}" → (${geocodedCoords.latitude.toFixed(4)}, ${geocodedCoords.longitude.toFixed(4)}) in ${geocodeDuration}ms`);
+            addAgentTrace(ctx, 'GeocodingAgent', 'geocode_origin', geocodeDuration, true);
+
+            // Stream reasoning if available
+            if (ctx.streamReasoning) {
+                await ctx.streamReasoning(`Found location: ${originName}`);
+            }
+        } else {
+            console.log(`[Geocoding] Could not geocode "${originName}", will use user's GPS location`);
+            addAgentTrace(ctx, 'GeocodingAgent', 'geocode_origin', geocodeDuration, false);
+        }
+    }
+
+    // ========================================
+    // LAYER 2: Location Filter (3km Radius)
+    // Priority: geocodedOrigin (from query) > userLocation (GPS)
+    // ========================================
+    // Determine the effective origin location for filtering
+    const filterLocation = ctx.geocodedOrigin || ctx.userLocation;
+
+    if (filterLocation && ctx.allStops && ctx.vehicles) {
+        const locationSource = ctx.geocodedOrigin
+            ? `geocoded origin: "${ctx.geocodedOrigin.placeName}"`
+            : 'user GPS location';
+        console.log(`[Layer2] Filtering stops within 3km of ${locationSource}...`);
+
         ctx.filteredStops = filterStopsBy3kmRadius(
-            ctx.userLocation.latitude,
-            ctx.userLocation.longitude,
+            filterLocation.latitude,
+            filterLocation.longitude,
             ctx.allStops,
             ctx.vehicles
         );

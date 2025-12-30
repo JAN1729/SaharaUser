@@ -311,7 +311,7 @@ class ChatViewModel @Inject constructor(
                 // Handle final response
                 if (finalResponse != null) {
                     val response = finalResponse!!
-                    _lastAgentsCalled.value = response.agentTrace.map { it.message }
+                    _lastAgentsCalled.value = response.agentTrace.map { "${it.agent}: ${it.action}" }
                     
                     // Add AI response to chat
                     val thinkingDuration = System.currentTimeMillis() - thinkingStartTime

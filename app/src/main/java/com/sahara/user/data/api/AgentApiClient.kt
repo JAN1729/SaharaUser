@@ -528,11 +528,21 @@ data class RouteData(
     @SerialName("busStopsAway") val busStopsAway: Int? = null
 )
 
+/**
+ * Trace event from the agent pipeline.
+ * Matches Edge Function's AgentTraceEntry format.
+ */
 @Serializable
 data class TraceEvent(
-    val type: String,
-    val message: String,
-    val timestamp: Long
+    // Edge Function sends 'agent' for the agent name
+    val agent: String = "",
+    val action: String = "",
+    @SerialName("durationMs") val durationMs: Long = 0,
+    val success: Boolean = true,
+    val timestamp: Long = 0,
+    // Legacy fields for backwards compatibility (just in case)
+    val type: String = "",
+    val message: String = ""
 )
 
 /**
