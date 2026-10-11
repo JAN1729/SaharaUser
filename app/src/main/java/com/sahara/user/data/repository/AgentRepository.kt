@@ -14,6 +14,8 @@ import kotlinx.serialization.json.JsonElement
 import com.sahara.user.data.model.ViewportState
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlinx.coroutines.flow.onStart
+import kotlinx.coroutines.flow.onCompletion
 
 /**
  * Agent Repository
@@ -138,19 +140,26 @@ class AgentRepository @Inject constructor(
         query: String,
         userLat: Double? = null,
         userLng: Double? = null,
-        viewportState: ViewportState? = null
+        viewportState: ViewportState? = null,
+        resetContext: Boolean = false
     ): kotlinx.coroutines.flow.Flow<AgentApiClient.StreamEvent> {
         Log.d(TAG, "Starting streaming query: $query (viewport=${viewportState != null})")
-        _isProcessing.value = true
-        
         return agentApiClient.processQueryStreaming(
             userId = userId,
             query = query,
             latitude = userLat,
             longitude = userLng,
-            viewportState = viewportState
-        )
+            viewportState = viewportState,
+            resetContext = resetContext
+        ).onStart { _isProcessing.value = true }
+            .onCompletion { _isProcessing.value = false }
     }
+
+    suspend fun checkServer() = agentApiClient.checkServer()
+    suspend fun refreshSearch(id: String) = agentApiClient.refreshSearch(id)
+    suspend fun journeyMap(id: String) = agentApiClient.journeyMap(id)
+    suspend fun journeyGuidance(id: String, progress: com.sahara.user.data.api.TripProgress? = null) = agentApiClient.journeyGuidance(id, progress)
+    suspend fun revalidateJourney(id: String) = agentApiClient.revalidateJourney(id)
     
     /**
      * Mark processing as complete (call after stream ends).

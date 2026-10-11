@@ -24,7 +24,7 @@ val SaharaGlassSurface = Color(0xCCFFFFFF) // High alpha white for glass
 
 // We are enforcing Light Mode for now, but keeping the structure valid.
 private val LightColorScheme = lightColorScheme(
-    primary = SaharaOrange,
+    primary = Color(0xFFC84316), // Accessible white button text while retaining the orange identity.
     onPrimary = SaharaWhite,
     secondary = SaharaBlack,
     onSecondary = SaharaWhite,

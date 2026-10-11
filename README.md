@@ -1,213 +1,210 @@
-# SaharaUser - AI Bus Route Assistant
+# Sahara — Multimodal Commute Intelligence & Real-Time Passenger Companion
 
-An intelligent Android application that helps users find optimal bus routes using a multi-agent AI system powered by Perplexity Sonar Pro.
+[![Android](https://img.shields.io/badge/Android-API%2026%2B-3DDC84?logo=android&logoColor=white)](https://developer.android.com)
+[![Kotlin](https://img.shields.io/badge/Kotlin-2.0-7F52FF?logo=kotlin&logoColor=white)](https://kotlinlang.org)
+[![Jetpack Compose](https://img.shields.io/badge/Jetpack%20Compose-Material%203-4285F4?logo=jetpackcompose&logoColor=white)](https://developer.android.com/jetpack/compose)
+[![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.115%2B-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
+[![MCP](https://img.shields.io/badge/Model%20Context%20Protocol-2.3.0-orange)](https://modelcontextprotocol.io)
+[![SQLite](https://img.shields.io/badge/SQLite-WAL%20Mode-003B57?logo=sqlite&logoColor=white)](https://sqlite.org)
 
-## ✅ Features
+**Sahara** is an end-to-end multimodal transit intelligence and navigation ecosystem tailored for complex journeys across India. It unifies **Rail, Intercity Buses (KSRTC Swift), Flights, and Local Transit** into a cohesive, evidence-backed itinerary planner with real-time driver fleet telemetry, interactive OpenStreetMap navigation, and step-by-step travel guidance.
 
-- 🤖 **AI-Powered Chat** - Natural language interface for route queries
-- 🚌 **Predefined Routes** - Works with routes created in Sahara Driver app
-- 📍 **Live Bus Tracking** - Real-time bus positions
-- ⏱️ **ETA Calculations** - Accurate arrival time estimates
-- 🔄 **Transfer Optimization** - Multi-bus journey planning
-- 👤 **User Profiles** - Personalized recommendations
-- 📱 **Cursor-like UI** - Shows which AI agents are working
+---
 
-## 🏗️ Architecture
+## 📸 Interface Showcase
 
-### Multi-Agent System
+| Search & Exploration | Multimodal Comparison | Step-by-Step Companion |
+| :---: | :---: | :---: |
+| ![Home Screen](docs/commute/sahara-home-final.png) | ![Journey Options](docs/commute/sahara-journey-final.png) | ![Companion View](docs/commute/sahara-companion-final.png) |
+| *Natural language query with instant terminal auto-suggestions* | *Side-by-side price, duration, transfer, and mode comparison* | *Active journey tracking with boarding alerts & connection margins* |
 
-```
-User Query
-    ↓
-┌─────────────────────────────────────────────────────┐
-│           Main Orchestrator                         │
-│           (Perplexity Sonar Pro)                   │
-│                                                     │
-│   Routes query to appropriate agents:               │
-│   • Route Search → SQL + Path + Time + BusTracker  │
-│   • Bus Location → BusTracker only                 │
-│   • ETA Query → Time + BusTracker                  │
-└────────────────┬────────────────────────────────────┘
-                 │
-    ┌────────────┼────────────┐
-    ↓            ↓            ↓
-┌───────┐  ┌──────────┐  ┌──────────┐
-│ SQL   │  │  Path    │  │  Time    │
-│ Agent │  │  Agent   │  │  Agent   │
-└───┬───┘  └────┬─────┘  └────┬─────┘
-    │           │             │
-    ↓           ↓             ↓
-Supabase   Algorithms    Formulas
-```
+---
 
-### All Agents (9 Total)
+## ⚡ Core Features
 
-| Agent | Purpose |
-|-------|---------|
-| **Main Orchestrator** | Query routing & result aggregation |
-| **SQL Agent** | Database queries (vehicles, stops) |
-| **Path Agent** | Find shortest predefined path |
-| **Time Agent** | ETA calculations with traffic |
-| **Bus Tracker Agent** | Live bus positions |
-| **User Context Agent** | Preferences & history |
-| **Transfer Agent** | Multi-bus journey optimization |
-| **Analytics Agent** | Usage patterns & insights |
-| **Communication Agent** | NLU & response formatting |
+- 🚆 **True Multimodal Journey Planning**: Connects Indian Railways (ConfirmTkt/RailYatri parsed DOMs), state and intercity bus routes (Kerala KSRTC Swift DOM parser), domestic flight quotes (Google Flights rendered DOM), and walking access/egress links into single verified itineraries.
+- 💬 **Constraint & Intent-Aware AI Assistant**: Natural language travel parsing powered by OpenRouter / DeepSeek with strict deterministic planning rules. The AI understands budgets, transfers, departure deadlines, walking limits, and accessibility constraints without inventing non-existent inventory.
+- 🧭 **Real-Time Passenger Companion**:
+  - Live step-by-step boarding instructions with exact terminal pinpoints.
+  - Connection margin warnings and dynamic transfer buffer tracking.
+  - Manual boarding and leg completion validation following strict chronological travel order.
+  - Automatic replanning on disruption while locking already-travelled legs.
+- 🗺️ **Interactive OpenStreetMap Integration**: Native map rendering with hardware acceleration, terminal pins, route shapes, fit-to-route controls, and zoom/pan gestures.
+- 🚌 **Live Driver Fleet Adapter**: Read-only connection to the [Sahara Driver](https://github.com/JAN1729/Sahara) Supabase database (`vehicles`, `route_stops`, `locations`), streaming real-time bus positions onto the user map.
+- 🌐 **VisaGuy MCP Federation Gateway**: Standalone Model Context Protocol (MCP 2.3.0) package with 20 tools, TypeSafe JEV System-1 intent hyperclassification (<10ms latency), and cross-border commute travel advisory.
+- 📡 **Resilient SSE Streaming**: Server-Sent Events (SSE) stream incremental event frames to the Android app, showing real-time planning progress and partial source collector status.
 
-### Algorithms (Pre-coded, No ML)
+---
 
-- **Haversine** - GPS distance calculation
-- **Dijkstra** - Shortest path finding
-- **A*** - Heuristic-guided pathfinding
-
-## 📁 Project Structure
+## 🏗️ System Architecture
 
 ```
-d:\SaharaUser\
-├── build.gradle.kts
-├── settings.gradle.kts
-├── local.properties.template     ← Copy to local.properties & add API key
-├── README.md
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                       Sahara Android Client (Kotlin)                        │
+│   Jetpack Compose UI  •  OSMdroid Map Engine  •  Foreground Journey Monitor  │
+└──────────────────────────────────────┬──────────────────────────────────────┘
+                                       │ HTTP / SSE Stream
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    Central Planning Server (FastAPI)                        │
+│                                                                             │
+│  ┌──────────────────────────┐             ┌──────────────────────────────┐  │
+│  │   NLU Language Parser    │             │   Multimodal Journey Graph   │  │
+│  │ (OpenRouter / DeepSeek)  │             │   • Chronological Search     │  │
+│  └─────────────┬────────────┘             │   • Transfer Buffer Planning │  │
+│                │                          │   • Disruption Replanner     │  │
+│                ▼                          └──────────────┬───────────────┘  │
+│  ┌──────────────────────────┐                            │                  │
+│  │    SQLite WAL Storage    │                            │                  │
+│  │  (Journeys, Progress)    │                            │                  │
+│  └──────────────────────────┘                            │                  │
+└───────────────────┬──────────────────────────────────────┼──────────────────┘
+                    │                                      │
+         ┌──────────┴──────────┐                ┌──────────┴──────────┐
+         ▼                     ▼                ▼                     ▼
+┌─────────────────┐   ┌─────────────────┐   ┌─────────────────┐   ┌─────────────────┐
+│ Public Rail DOM │   │ KSRTC Swift DOM │   │  Google Flights │   │  Sahara Driver  │
+│    Collector    │   │    Collector    │   │   DOM Collector │   │ Supabase Fleet  │
+└─────────────────┘   └─────────────────┘   └─────────────────┘   └─────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                   VisaGuy MCP 2.3.0 Federation Gateway                      │
+│   TypeSafe JEV System-1 Hyperclassifier  •  Cross-Border Travel Advisory    │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 📁 Repository Structure
+
+```
+Sahara/
+├── app/                              # Android Passenger Client (Kotlin / Compose)
+│   ├── src/main/
+│   │   ├── java/com/sahara/user/
+│   │   │   ├── data/api/             # CommuteBackend, SSE EventFrames, JourneyGuidance
+│   │   │   ├── ui/screens/           # HomeScreen, ChatScreen, ServerScreen
+│   │   │   ├── ui/components/        # JourneyResults, JourneyFollowPanel, MapPanel
+│   │   │   └── service/              # RealtimeBusManager (Supabase driver adapter)
+│   │   └── res/                      # Terminal pins, XML themes, vector drawables
+│   └── src/test/                     # Android Unit Tests (Contracts, Guidance, Maps)
 │
-├── app/
-│   ├── build.gradle.kts
-│   └── src/main/
-│       ├── AndroidManifest.xml
-│       └── java/com/sahara/user/
-│           ├── SaharaUserApp.kt
-│           ├── MainActivity.kt
-│           │
-│           ├── agents/              # AI Agents (9 files)
-│           │   ├── BaseAgent.kt
-│           │   ├── MainOrchestrator.kt
-│           │   ├── SQLAgent.kt
-│           │   ├── PathAgent.kt
-│           │   ├── TimeAgent.kt
-│           │   ├── BusTrackerAgent.kt
-│           │   ├── UserContextAgent.kt
-│           │   ├── TransferAgent.kt
-│           │   ├── AnalyticsAgent.kt
-│           │   └── CommunicationAgent.kt
-│           │
-│           ├── algorithms/          # Pre-coded algorithms
-│           │   ├── Haversine.kt
-│           │   ├── Dijkstra.kt
-│           │   └── AStar.kt
-│           │
-│           ├── data/
-│           │   ├── api/
-│           │   │   ├── PerplexityClient.kt
-│           │   │   └── SupabaseApiClient.kt
-│           │   ├── model/
-│           │   │   ├── User.kt
-│           │   │   └── Route.kt
-│           │   └── repository/
-│           │       ├── RouteRepository.kt
-│           │       └── UserRepository.kt
-│           │
-│           ├── di/
-│           │   └── AppModule.kt     # Hilt DI
-│           │
-│           └── ui/
-│               ├── theme/
-│               ├── navigation/
-│               ├── screens/
-│               │   ├── ChatScreen.kt    # Main Cursor-like UI
-│               │   ├── LoginScreen.kt
-│               │   └── ProfileScreen.kt
-│               └── viewmodel/
-│                   └── ChatViewModel.kt
+├── backend/                          # Central Planning Server (Python / FastAPI)
+│   ├── sahara/
+│   │   ├── api.py                    # REST and SSE API endpoints
+│   │   ├── broker.py                 # Real-time event broker & frame dispatch
+│   │   ├── planner.py                # Multimodal chronological journey planner
+│   │   ├── language.py               # OpenRouter / DeepSeek NLU request parser
+│   │   ├── guidance.py               # Real-time companion boarding & connection guidance
+│   │   ├── storage.py                # SQLite WAL storage engine
+│   │   └── providers/                # Rail, KSRTC bus, and Flight DOM collectors
+│   ├── tests/                        # 79 passing unit & regression tests
+│   └── start-central-server.ps1      # One-click startup script for Windows
 │
-└── docs/
-    ├── SUPABASE_USER_SCHEMA.sql     # Run in Supabase
-    ├── PREDEFINED_ROUTES.md         # How routes work
-    └── MCP_INTEGRATION.md           # MCP servers guide
+├── visaguy_mcp/                      # Standalone MCP 2.3.0 Connector Package
+│   ├── visaguy_mcp/
+│   │   ├── server.py                 # MCP Server exposing 20 registered tools
+│   │   ├── hyperclassifier.py        # TypeSafe JEV System-1 routing (<10ms)
+│   │   ├── federation.py             # Multi-MCP travel federation registry
+│   │   └── gateway.py                # FastAPI SSE gateway for remote MCP clients
+│   └── tests/                        # 15 MCP end-to-end integration tests
+│
+└── docs/                             # Engineering Documentation
+    └── commute/
+        ├── CENTRAL_SERVER_RUNBOOK.md # Detailed server deployment runbook
+        ├── CENTRAL_SERVER_DESIGN.md  # Architectural deep-dive
+        ├── DELIVERY_2026-10-11.md    # Pilot delivery report and operational limits
+        └── APP_UI_VERIFICATION_2026-10-10.md # UI verification and test ledger
 ```
 
-## 🚀 Setup Instructions
+---
 
-### Step 1: Configure Perplexity API Key
+## 🚀 Quick Start Guide
 
-1. Go to https://www.perplexity.ai/settings/api
-2. Create an API key (format: `pplx-xxxx...`)
-3. Copy `local.properties.template` to `local.properties`
-4. Replace `pplx-YOUR-API-KEY-HERE` with your actual key
+### 1. Prerequisites
+- **Android**: Android Studio Ladybug+ with JDK 17, Android SDK 26+
+- **Backend**: Python 3.11 or newer, Windows / Linux / macOS
+- **Git**
 
-```properties
-PERPLEXITY_API_KEY=pplx-your-actual-key-here
+---
+
+### 2. Launch the Central Planning Server
+
+```powershell
+cd backend
+
+# Create and activate virtual environment
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+
+# Install package and dependencies
+pip install -e .
+
+# Configure environment
+Copy-Item .env.example .env
+# Edit .env and supply your OPENROUTER_API_KEY (optional, falls back to rule-based parser)
+
+# Start server (default: port 8787)
+.\start-central-server.ps1
+# Or directly via uvicorn:
+# uvicorn sahara.api:app --host 0.0.0.0 --port 8787
 ```
 
-### Step 2: Run SQL Migration (User's Task)
+*Server diagnostics are available at `http://127.0.0.1:8787`.*
 
-Run this in Supabase SQL Editor:
-- File: `docs/SUPABASE_USER_SCHEMA.sql`
-- Creates: `users`, `user_trips`, `user_search_history` tables
+---
 
-### Step 3: Open in Android Studio
+### 3. Build & Run Android Passenger App
 
-1. File → Open → `D:\SaharaUser`
-2. Wait for Gradle sync
-3. If prompted, update Gradle version
+1. Open Android Studio and select `Sahara/`.
+2. Let Gradle sync project dependencies.
+3. Configure Backend Connection:
+   - **Android Emulator**: Automatically defaults to `http://10.0.2.2:8787`.
+   - **Physical Device**: Tap **Server Settings** in the app header and enter your computer's local LAN IP (e.g., `http://192.168.1.15:8787`).
+4. Click **Run** (`Shift + F10`) to deploy to your device or emulator.
 
-### Step 4: Build and Run
+---
 
-1. Build → Make Project
-2. Run on device or emulator (API 26+)
+### 4. (Optional) Run VisaGuy MCP Server
 
-## 📝 Usage
+```powershell
+cd visaguy_mcp
 
-### Example Queries
+# Install in editable mode
+pip install -e .
 
+# Run MCP server in stdio mode:
+python -m visaguy_mcp.cli serve --transport stdio
+
+# Or launch SSE gateway on port 8000:
+python -m visaguy_mcp.gateway 8000
 ```
-"Take me from MG Road to Electronic City"
-"Where is the Blue Line bus?"
-"When will the next bus arrive at Koramangala?"
-"Show me stops near Indiranagar"
-```
 
-### What You'll See
+---
 
-1. **Thinking Process** - Shows which agents are working
-2. **Step Progress** - Understanding → Searching → Analyzing
-3. **Agent Status** - "Calling Path Agent... Finding shortest paths"
-4. **Final Response** - Route with vehicle name, stops, distance, ETA
+## 🧪 Verification & Test Suite
 
-## 🔧 MCP Integration (Optional)
+The codebase is backed by comprehensive unit and integration test suites:
 
-For enhanced capabilities, you can connect these MCP servers:
+- **Backend**: **79 / 79 tests passing** (`python -m unittest discover -s backend/tests -q`)
+  - Validates multimodal search, chronological transfers, sold-out services, late departure rollovers, and locked-prefix recovery.
+- **Android**: **All unit tests passing** (`./gradlew :app:testDebugUnitTest`)
+  - Validates SSE stream parsing (`EventFramesTest`), guidance state machines (`JourneyGuidanceTest`), contract mappings (`JourneyContractTest`), and gesture states (`MapGestureStateTest`).
+- **VisaGuy MCP**: **15 / 15 tests passing** (`pytest visaguy_mcp/tests`)
+  - Validates sub-10ms hyperclassification, doorway discovery, federation registrations, and travel advisory tools.
 
-| Server | Purpose | Priority |
-|--------|---------|----------|
-| `perplexity-ask` | Already integrated via API | ✅ Done |
-| `supabase-mcp-server` | Flexible SQL queries | Optional |
-| `sequential-thinking` | Complex multi-leg routes | Optional |
+---
 
-See `docs/MCP_INTEGRATION.md` for setup details.
+## 🔒 Security & Data Hygiene
 
-## 📊 Supabase Tables
+- API secrets, keystores, and local environment files (`.env`, `local.properties`) are strictly ignored via `.gitignore`.
+- Production APK builds omit debug gateway tokens and developer endpoints.
+- Supabase driver fleet telemetry operates over a read-only role with no write permissions to driver schedules.
 
-### New Tables (created by migration)
-
-| Table | Purpose |
-|-------|---------|
-| `users` | User profiles (USR-XXXXXXXX IDs) |
-| `user_trips` | Trip history |
-| `user_search_history` | Personalization data |
-
-### Existing Tables (from Driver app)
-
-| Table | Purpose |
-|-------|---------|
-| `vehicles` | Bus information |
-| `route_stops` | Stop locations with order |
-| `locations` | Live bus GPS |
-
-## 📚 Key Documentation
-
-- [PREDEFINED_ROUTES.md](docs/PREDEFINED_ROUTES.md) - How routes work
-- [MCP_INTEGRATION.md](docs/MCP_INTEGRATION.md) - MCP setup
-- [SUPABASE_USER_SCHEMA.sql](docs/SUPABASE_USER_SCHEMA.sql) - Database schema
+---
 
 ## 📜 License
 
-Private - All rights reserved
+Private & Proprietary — All rights reserved.

@@ -18,6 +18,11 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import com.sahara.user.data.api.CommuteBackend
+import com.sahara.user.data.api.ProcessQueryResponse
 import kotlinx.serialization.json.Json
 import java.util.UUID
 import javax.inject.Inject
@@ -53,6 +58,14 @@ class ChatViewModel @Inject constructor(
     
     private val _isLoading = MutableStateFlow(false)
     val isLoading: StateFlow<Boolean> = _isLoading.asStateFlow()
+
+    private var queryJob: Job? = null
+    private var pollJob: Job? = null
+    private var queryGeneration = 0L
+    private val _connectionVersion = MutableStateFlow(0)
+    val connectionVersion = _connectionVersion.asStateFlow()
+    private val _connectionStatus = MutableStateFlow<String?>(null)
+    val connectionStatus = _connectionStatus.asStateFlow()
     
     private val _currentUser = MutableStateFlow<User?>(null)
     val currentUser: StateFlow<User?> = _currentUser.asStateFlow()
@@ -168,28 +181,8 @@ class ChatViewModel @Inject constructor(
     }
     
     private suspend fun initializeUser() {
-        val result = supabaseClient.getOrCreateUser("0000000000")
-        result.onSuccess { user ->
-            _currentUser.value = user
-            android.util.Log.d(TAG, "User initialized: ${user.id}")
-            
-            // Initialize location sync with user ID
-            userLocationSyncManager.initialize(
-                userId = user.id,
-                trackingId = user.trackingId
-            )
-            android.util.Log.d(TAG, "Location sync initialized with trackingId: ${userLocationSyncManager.getTrackingId()}")
-            
-            // If location permission is already granted, start syncing immediately
-            if (locationService.hasLocationPermission()) {
-                locationService.startLocationUpdates()
-                userLocationSyncManager.startSyncing()
-                _hasLocationPermission.value = true
-                android.util.Log.d(TAG, "Location permission already granted, started sync automatically")
-            }
-        }.onFailure { error ->
-            android.util.Log.e(TAG, "Failed to initialize user: ${error.message}")
-        }
+        // The central server owns a persistent random session. Do not create a shared
+        // passenger account or upload location without authenticated account ownership.
     }
     
     private fun checkLocationPermission() {
@@ -222,10 +215,14 @@ class ChatViewModel @Inject constructor(
      * 3. Backend algorithms calculate: Haversine, ETA, RouteMatcher
      * 4. Receive SHORT, data-grounded response
      */
-    fun sendMessage(content: String) {
-        if (content.isBlank()) return
+    fun sendMessage(content: String): Boolean {
+        if (content.isBlank() || _isLoading.value) return false
+        pollJob?.cancel()
+        val generation = ++queryGeneration
+        val resetContext = _messages.value.isEmpty()
+        _isLoading.value = true
         
-        viewModelScope.launch {
+        queryJob = viewModelScope.launch {
             // Add user message
             val userMessage = ChatMessage(
                 id = UUID.randomUUID().toString(),
@@ -235,12 +232,12 @@ class ChatViewModel @Inject constructor(
             _messages.value = _messages.value + userMessage
             
             // EPHEMERAL: Clear previous map visualization on new query
-            _activeMapTool.value = null
+            clearMapTool()
             
             // Show loading with empty thinking steps (will be filled by stream)
             _isLoading.value = true
             _statusMessage.value = "Processing..."
-            _thinkingSteps.value = listOf(ThinkingStep("Connecting to AI...", isActive = true))
+            _thinkingSteps.value = listOf(ThinkingStep("Connecting to Sahara…", isActive = true))
             
             // Track thinking duration
             val thinkingStartTime = System.currentTimeMillis()
@@ -253,6 +250,8 @@ class ChatViewModel @Inject constructor(
                     if (_hasLocationPermission.value) {
                         locationService.getCurrentLocation()
                     } else null
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (e: Exception) {
                     android.util.Log.w(TAG, "Could not get location: ${e.message}")
                     null
@@ -260,6 +259,7 @@ class ChatViewModel @Inject constructor(
                 
                 // Use STREAMING API for real-time reasoning display
                 var finalResponse: com.sahara.user.data.api.ProcessQueryResponse? = null
+                var streamError: String? = null
                 val reasoningSteps = mutableListOf<String>()
                 
                 android.util.Log.d(TAG, ">>> Starting stream collection...")
@@ -269,7 +269,8 @@ class ChatViewModel @Inject constructor(
                     query = content,
                     userLat = location?.latitude,
                     userLng = location?.longitude,
-                    viewportState = _viewportState.value
+                    viewportState = _viewportState.value,
+                    resetContext = resetContext
                 ).collect { event ->
                     android.util.Log.d(TAG, ">>> Received event: ${event::class.simpleName}")
                     when (event) {
@@ -298,6 +299,7 @@ class ChatViewModel @Inject constructor(
                             finalResponse = event.response
                         }
                         is com.sahara.user.data.api.AgentApiClient.StreamEvent.Error -> {
+                            streamError = event.message
                             android.util.Log.e(TAG, ">>> ERROR EVENT: ${event.message}")
                         }
                     }
@@ -325,7 +327,8 @@ class ChatViewModel @Inject constructor(
                             "success" to response.success.toString()
                         ),
                         thinkingSteps = reasoningSteps.toList(),
-                        thinkingDurationMs = thinkingDuration
+                        thinkingDurationMs = thinkingDuration,
+                        result = response
                     )
                     _messages.value = _messages.value + aiMessage
                     
@@ -342,7 +345,7 @@ class ChatViewModel @Inject constructor(
                                     android.util.Log.d(TAG, ">>> MAP TOOL ACTIVATED: ${toolCall.tool} with ${mapData.stopsToMark.size} stops")
                                     
                                     // Start real-time tracking if we have a vehicle ID
-                                    if (mapData.vehicleId.isNotBlank()) {
+                                    if (mapData.vehicleId.isNotBlank() && com.sahara.user.config.SecureConfig.getSupabaseUrl().isNotBlank()) {
                                         startRealtimeTracking(mapData.vehicleId)
                                     }
                                 }
@@ -366,16 +369,21 @@ class ChatViewModel @Inject constructor(
                     android.util.Log.d(TAG, "Query: $content")
                     android.util.Log.d(TAG, "Intent: ${response.intent}")
                     android.util.Log.d(TAG, "Response: ${response.response.take(100)}...")
+                    if (!response.collectionComplete && response.searchId != null) {
+                        pollSearch(response.searchId, aiMessage.id, generation)
+                    }
                 } else {
                     // No response received
                     val errorMessage = ChatMessage(
                         id = UUID.randomUUID().toString(),
-                        content = "Sorry, couldn't get a response. Please try again.",
+                        content = streamError ?: "The server returned no result. Check the connection and try again.",
                         isUser = false
                     )
                     _messages.value = _messages.value + errorMessage
                 }
                 
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 android.util.Log.e(TAG, "Error: ${e.message}", e)
                 
@@ -387,11 +395,61 @@ class ChatViewModel @Inject constructor(
                 _messages.value = _messages.value + errorMessage
                 
             } finally {
-                _isLoading.value = false
-                _statusMessage.value = null
-                _thinkingSteps.value = emptyList()
+                if (generation == queryGeneration) {
+                    agentRepository.markProcessingComplete()
+                    _isLoading.value = false
+                    _statusMessage.value = null
+                    _thinkingSteps.value = emptyList()
+                }
             }
         }
+        return true
+    }
+
+    private fun pollSearch(id: String, messageId: String, generation: Long) {
+        pollJob?.cancel()
+        pollJob = viewModelScope.launch {
+            try {
+                repeat(20) {
+                    delay(2000)
+                    val response = agentRepository.refreshSearch(id)
+                    if (generation != queryGeneration) return@launch
+                    _messages.value = _messages.value.map {
+                        if (it.id == messageId) it.copy(content = response.response, result = response) else it
+                    }
+                    if (response.collectionComplete) return@launch
+                }
+                if (generation == queryGeneration) updatePollingError(messageId, "Sources are taking longer than expected. Retry the search for an update.")
+            } catch (e: CancellationException) { throw e }
+            catch (e: Exception) {
+                if (generation == queryGeneration) updatePollingError(messageId, "Search updates unavailable. Check the server connection and retry.")
+            }
+        }
+    }
+
+    private fun updatePollingError(messageId: String, message: String) {
+        _messages.value = _messages.value.map {
+            if (it.id == messageId) it.copy(result = it.result?.copy(collectionError = message)) else it
+        }
+    }
+
+    fun saveConnection(address: String, key: String, mode: String): String? {
+        return try {
+            // Validate before cancelling so invalid input does not destroy a search.
+            com.sahara.user.data.api.normalizeServerAddress(address, com.sahara.user.BuildConfig.DEBUG)
+            CommuteBackend.save(address, key, mode)
+            clearChat()
+            _connectionVersion.value++
+            _connectionStatus.value = "Connection saved"
+            null
+        } catch (e: IllegalArgumentException) { e.message }
+    }
+
+    suspend fun checkServer(): String {
+        return try { agentRepository.checkServer() }
+        catch (e: CancellationException) { throw e }
+        catch (e: IllegalStateException) { e.message ?: "The server response was not valid." }
+        catch (e: Exception) { "Cannot reach the server. Check its address, that it is running, and your network." }
     }
 
     // ==================== UI ACTIONS ====================
@@ -404,6 +462,15 @@ class ChatViewModel @Inject constructor(
     }
     
     fun clearChat() {
+        ++queryGeneration
+        queryJob?.cancel()
+        pollJob?.cancel()
+        queryJob = null
+        pollJob = null
+        _isLoading.value = false
+        agentRepository.markProcessingComplete()
+        agentRepository.clearLastResponse()
+        stopRealtimeTracking()
         _messages.value = emptyList()
         _statusMessage.value = null
         _activeAgents.value = emptyList()
@@ -415,6 +482,9 @@ class ChatViewModel @Inject constructor(
     }
     
     suspend fun getCurrentLocation() = locationService.getCurrentLocation()
+    suspend fun journeyMap(id: String) = agentRepository.journeyMap(id)
+    suspend fun journeyGuidance(id: String, progress: com.sahara.user.data.api.TripProgress? = null) = agentRepository.journeyGuidance(id, progress)
+    suspend fun revalidateJourney(id: String) = agentRepository.revalidateJourney(id)
     
     fun trackBus(busName: String) {
         viewModelScope.launch {

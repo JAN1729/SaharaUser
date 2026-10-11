@@ -37,7 +37,7 @@ class RealtimeBusManager @Inject constructor(
         private const val EVENT_LOCATION_UPDATE = "location_update"
     }
 
-    private val client = supabaseApiClient.client
+    private val client by lazy { supabaseApiClient.client }
 
     /**
      * Subscribe to live bus movement updates.

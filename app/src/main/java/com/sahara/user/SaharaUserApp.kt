@@ -14,6 +14,7 @@ class SaharaUserApp : Application() {
     
     override fun onCreate() {
         super.onCreate()
+        com.sahara.user.data.api.CommuteBackend.initialize(this)
         // Initialize any app-level components here
     }
 }

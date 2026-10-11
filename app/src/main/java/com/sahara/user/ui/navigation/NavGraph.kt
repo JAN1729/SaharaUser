@@ -10,6 +10,7 @@ import com.sahara.user.ui.screens.HomeScreen
 import com.sahara.user.ui.screens.LoginScreen
 import com.sahara.user.ui.screens.ProfileScreen
 import com.sahara.user.ui.screens.ThinkingScreen
+import com.sahara.user.ui.screens.ServerScreen
 
 /**
  * Navigation Routes
@@ -20,6 +21,7 @@ object Routes {
     const val CHAT = "chat" // Thinking/Chat Screen
     const val THINKING = "thinking"
     const val PROFILE = "profile"
+    const val SERVER = "server"
 }
 
 /**
@@ -37,8 +39,8 @@ fun SaharaUserNavGraph(
     ) {
         composable(Routes.HOME) {
             HomeScreen(
-                onNavigateToProfile = {
-                    navController.navigate(Routes.PROFILE)
+                onNavigateToSettings = {
+                    navController.navigate(Routes.SERVER)
                 },
                 onNavigateToChat = {
                     navController.navigate(Routes.THINKING)
@@ -54,6 +56,10 @@ fun SaharaUserNavGraph(
                 },
                 viewModel = sharedViewModel
             )
+        }
+
+        composable(Routes.SERVER) {
+            ServerScreen(onBack = { navController.popBackStack() }, viewModel = sharedViewModel)
         }
 
         composable(Routes.LOGIN) {

@@ -1,0 +1,63 @@
+{
+  "captured_at": "2026-10-10T06:17:00Z",
+  "source": "https://assets.onlineksrtcswift.com/api/resource/searchRoutesV4",
+  "rows": [
+    {
+      "RouteScheduleId": "47~50~10072~298~2026-10-15",
+      "CompanyId": 4,
+      "CompanyName": "kozhikode depot",
+      "DepartureTime": "2026-10-15T22:00:00",
+      "ArrivalTime": "2026-10-16T06:55:00",
+      "DefaultCurrencyID": 1,
+      "Fare": 553,
+      "AvailableSeats": 36,
+      "ServiceID": 47,
+      "TripID": 50,
+      "FromCityID": 10072,
+      "ToCityID": 298,
+      "JourneyDate": "2026-10-15",
+      "ChartDate": "2026-10-15",
+      "TripCode": "2200KKDBNG",
+      "ServiceType": "SUPER DELUXE AIR BUS",
+      "BookingAllowedDate": ""
+    },
+    {
+      "RouteScheduleId": "493~549~10072~298~2026-10-14",
+      "CompanyId": 7,
+      "CompanyName": "ernakulam depot",
+      "DepartureTime": "2026-10-15T00:05:00",
+      "ArrivalTime": "2026-10-15T07:50:00",
+      "DefaultCurrencyID": 1,
+      "Fare": 553,
+      "AvailableSeats": 39,
+      "ServiceID": 493,
+      "TripID": 549,
+      "FromCityID": 10072,
+      "ToCityID": 298,
+      "JourneyDate": "2026-10-15",
+      "ChartDate": "2026-10-14",
+      "TripCode": "1805EKMBNG",
+      "ServiceType": "SUPER DELUXE AIR BUS",
+      "BookingAllowedDate": "2026-10-14 00:05:00"
+    },
+    {
+      "RouteScheduleId": "4782~4975~10072~298~2026-10-14",
+      "CompanyId": 11,
+      "CompanyName": "kottarakkara depot",
+      "DepartureTime": "2026-10-15T00:26:00",
+      "ArrivalTime": "2026-10-15T07:41:00",
+      "DefaultCurrencyID": 1,
+      "Fare": 688,
+      "AvailableSeats": 47,
+      "ServiceID": 4782,
+      "TripID": 4975,
+      "FromCityID": 10072,
+      "ToCityID": 298,
+      "JourneyDate": "2026-10-15",
+      "ChartDate": "2026-10-14",
+      "TripCode": "1401KTRBNG",
+      "ServiceType": "AC SEATER CUM SLEEPER",
+      "BookingAllowedDate": "2026-10-14 00:26:00"
+    }
+  ]
+}

@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Search
@@ -66,8 +67,9 @@ fun LiquidGlassCard(
  */
 @Composable
 fun SaharaTopBar(
-    onMenuClick: () -> Unit,
-    onProfileClick: () -> Unit,
+    onMenuClick: () -> Unit = {},
+    onProfileClick: () -> Unit = {},
+    onBackClick: (() -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     Row(
@@ -78,17 +80,31 @@ fun SaharaTopBar(
         horizontalArrangement = Arrangement.SpaceBetween
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            // Hamburger Menu
-            IconButton(
-                onClick = onMenuClick,
-                modifier = Modifier.size(32.dp) // Slightly larger
-            ) {
-                Icon(
-                    imageVector = Icons.Default.Menu,
-                    contentDescription = "Menu",
-                    tint = Color.Black,
-                    modifier = Modifier.size(28.dp)
-                )
+            if (onBackClick != null) {
+                IconButton(
+                    onClick = onBackClick,
+                    modifier = Modifier.size(32.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.ArrowBack,
+                        contentDescription = "Back",
+                        tint = Color.Black,
+                        modifier = Modifier.size(28.dp)
+                    )
+                }
+            } else {
+                // Hamburger Menu
+                IconButton(
+                    onClick = onMenuClick,
+                    modifier = Modifier.size(32.dp) // Slightly larger
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Menu,
+                        contentDescription = "Menu",
+                        tint = Color.Black,
+                        modifier = Modifier.size(28.dp)
+                    )
+                }
             }
             
             Spacer(modifier = Modifier.width(12.dp))
@@ -159,7 +175,7 @@ fun SaharaSearchBar(
                     value = query,
                     onValueChange = onQueryChange,
                     keyboardActions = androidx.compose.foundation.text.KeyboardActions(
-                        onDone = { onSearch() }
+                        onSearch = { onSearch() }
                     ),
                     keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
                         imeAction = androidx.compose.ui.text.input.ImeAction.Search

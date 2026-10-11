@@ -598,5 +598,6 @@ data class ChatMessage(
     val isUser: Boolean,
     val metadata: Map<String, String>? = null,
     val thinkingSteps: List<String> = emptyList(),
-    val thinkingDurationMs: Long = 0
+    val thinkingDurationMs: Long = 0,
+    val result: com.sahara.user.data.api.ProcessQueryResponse? = null
 )

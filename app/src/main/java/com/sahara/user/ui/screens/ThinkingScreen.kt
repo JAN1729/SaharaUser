@@ -1,233 +1,73 @@
 package com.sahara.user.ui.screens
 
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowUpward
-import androidx.compose.material.icons.filled.Check
-import androidx.compose.material.icons.filled.ExpandLess
-import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
-import com.sahara.user.ui.components.SaharaTopBar
-import com.sahara.user.ui.theme.SaharaOrange
-import com.sahara.user.ui.components.CollapsibleThinkingCard
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.sahara.user.ui.components.*
 import com.sahara.user.ui.viewmodel.ChatViewModel
-import com.sahara.user.ui.viewmodel.ThinkingStep
-import kotlinx.coroutines.launch
+import com.sahara.user.data.api.CommuteBackend
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ThinkingScreen(
-    onNavigateBack: () -> Unit,
-    viewModel: ChatViewModel = hiltViewModel()
-) {
-    val messages by viewModel.messages.collectAsState()
-    val thinkingSteps by viewModel.thinkingSteps.collectAsState()
-    val isLoading by viewModel.isLoading.collectAsState()
-    
+fun ThinkingScreen(onNavigateBack: () -> Unit, viewModel: ChatViewModel = hiltViewModel()) {
+    val messages by viewModel.messages.collectAsStateWithLifecycle()
+    val steps by viewModel.thinkingSteps.collectAsStateWithLifecycle()
+    val loading by viewModel.isLoading.collectAsStateWithLifecycle()
+    var input by rememberSaveable { mutableStateOf("") }
+    var followedJourney by remember { mutableStateOf<com.sahara.user.data.api.JourneyOption?>(null) }
+    val companion = rememberJourneyFollower(followedJourney, viewModel::journeyGuidance, viewModel::revalidateJourney)
+    LaunchedEffect(messages.count { it.isUser }) { followedJourney = null }
     val listState = rememberLazyListState()
-    var inputText by remember { mutableStateOf("") }
-    val coroutineScope = rememberCoroutineScope()
-
-    // Auto-scroll on new messages
-    LaunchedEffect(messages.size, thinkingSteps.size) {
-        if (messages.isNotEmpty()) {
-            listState.animateScrollToItem(messages.size + if (isLoading) 1 else 0)
-        }
+    val latest = messages.lastOrNull { it.result != null }?.result
+    val journey = latest?.journeys?.firstOrNull()
+    val title = when {
+        loading -> "Finding your journey"
+        journey != null -> "${latest.placeNames[journey.origin] ?: "Origin"} → ${latest.placeNames[journey.destination] ?: "Destination"}"
+        else -> "Your journey"
     }
-
-    Scaffold(
-        containerColor = Color.White,
-        modifier = Modifier.systemBarsPadding(), // FIX: Status Bar Collision
-        topBar = {
-            SaharaTopBar(
-                onMenuClick = { /* TODO */ },
-                onProfileClick = { /* TODO */ }
-            )
-        }
+    LaunchedEffect(messages.size, loading) {
+        if (loading) followedJourney = null
+        val count = messages.size + if (loading) 1 else 0
+        if (count > 0) listState.animateScrollToItem(count - 1)
+    }
+    fun submit() { if (viewModel.sendMessage(input.trim())) input = "" }
+    Scaffold(modifier = Modifier.systemBarsPadding().imePadding(), containerColor = MaterialTheme.colorScheme.background,
+        topBar = { TopAppBar(title = { Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold,
+                maxLines = 1, overflow = TextOverflow.Ellipsis) },
+            colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background),
+            navigationIcon = { IconButton(onClick = onNavigateBack) { Icon(Icons.Default.ArrowBack, "Back") } },
+            actions = { IconButton(onClick = { followedJourney = null; viewModel.clearChat(); input = "" }) { Icon(Icons.Default.DeleteOutline, "Clear conversation") } }) },
+        bottomBar = { JourneyComposer(input, { input = it }, { submit() }, !loading, if (journey != null) "Refine this journey…" else "Ask Sahara…") }
     ) { padding ->
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(padding)
-        ) {
-            // Chat History Area
-            LazyColumn(
-                state = listState,
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp),
-                contentPadding = PaddingValues(bottom = 16.dp)
-            ) {
-                
-                // Render all messages
-                items(messages) { message ->
-                    Spacer(modifier = Modifier.height(16.dp))
-                    if (message.isUser) {
-                        UserMessageBubble(message.content)
-                    } else {
-                        // Show collapsible thinking card above AI response (if has thinking steps)
-                        if (message.thinkingSteps.isNotEmpty()) {
-                            CollapsibleThinkingCard(
-                                steps = message.thinkingSteps,
-                                isThinking = false,
-                                thinkingDurationMs = message.thinkingDurationMs
-                            )
-                            Spacer(modifier = Modifier.height(8.dp))
-                        }
-                        AgentMessageBubble(message.content)
-                    }
-                }
-
-                // Render "Thinking" Block if loading
-                if (isLoading) {
-                    item {
-                         Spacer(modifier = Modifier.height(16.dp))
-                         // Collapsible thinking card in active state
-                         CollapsibleThinkingCard(
-                             steps = thinkingSteps.map { it.description },
-                             isThinking = true,
-                             thinkingDurationMs = 0
-                         )
-                    }
+        LazyColumn(state = listState, modifier = Modifier.fillMaxSize().padding(padding),
+            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
+            if (messages.isEmpty()) item { ConversationBubble("Where would you like to go? Tell me the places and when you want to travel.", false) }
+            items(messages, key = { it.id }) { message ->
+                if (message.isUser) ConversationBubble(message.content, true)
+                else message.result?.let { JourneyResults(it, viewModel::journeyMap, CommuteBackend.enabled,
+                    companion, followedJourney?.id, { option, active ->
+                        if (active) followedJourney = option else if (followedJourney?.id == option.id) followedJourney = null
+                    }) } ?: ConversationBubble(message.content, false)
+            }
+            if (loading) item(key = "progress") {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    ConversationBubble("I’ll compare the full journey, including available connections.", false)
+                    JourneyProgress(steps.lastOrNull()?.description ?: "Checking sources and connections…")
                 }
             }
-
-            // Input Area
-            ChatInputArea(
-                text = inputText,
-                onTextChange = { inputText = it },
-                onSend = {
-                    if (inputText.isNotBlank()) {
-                        viewModel.sendMessage(inputText)
-                        inputText = ""
-                    }
-                },
-                enabled = !isLoading
-            )
-        }
-    }
-}
-
-@Composable
-fun UserMessageBubble(text: String) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.End
-    ) {
-        Box(
-            modifier = Modifier
-                .clip(RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp, bottomStart = 20.dp, bottomEnd = 4.dp))
-                .background(Color.White) 
-                .border(1.dp, SaharaOrange, RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp, bottomStart = 20.dp, bottomEnd = 4.dp)) // Orange Outline
-                .padding(horizontal = 16.dp, vertical = 12.dp)
-        ) {
-            Text(
-                text = text,
-                color = Color.Black, // Black text on White
-                style = MaterialTheme.typography.bodyLarge
-            )
-        }
-    }
-}
-
-@Composable
-fun AgentMessageBubble(text: String) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.Start
-    ) {
-        // Maybe an avatar?
-        Box(
-            modifier = Modifier
-                .widthIn(max = 300.dp) // Don't span full width for readability
-                .padding(vertical = 4.dp)
-        ) {
-            Text(
-                text = text,
-                color = Color.Black,
-                style = MaterialTheme.typography.bodyLarge
-            )
-        }
-    }
-}
-
-/**
- * The "Deep Reference Box" for Thinking Process
- */
-
-
-@Composable
-fun ChatInputArea(
-    text: String,
-    onTextChange: (String) -> Unit,
-    onSend: () -> Unit,
-    enabled: Boolean
-) {
-    // Divider
-    HorizontalDivider(color = Color.LightGray.copy(alpha = 0.5f))
-    
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(16.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        // Text Field
-        Box(
-            modifier = Modifier
-                .weight(1f)
-                .heightIn(min = 48.dp)
-                .clip(RoundedCornerShape(24.dp))
-                .background(Color(0xFFF5F5F5)) // Light Gray background
-                .padding(horizontal = 16.dp),
-            contentAlignment = Alignment.CenterStart
-        ) {
-            if (text.isEmpty()) {
-                Text("Ask anything...", color = Color.Gray)
-            }
-            androidx.compose.foundation.text.BasicTextField(
-                value = text,
-                onValueChange = onTextChange,
-                enabled = enabled,
-                textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black),
-                modifier = Modifier.fillMaxWidth()
-            )
-        }
-        
-        Spacer(modifier = Modifier.width(12.dp))
-        
-        // Send Button
-        IconButton(
-            onClick = onSend,
-            enabled = enabled && text.isNotBlank(),
-            modifier = Modifier
-                .size(48.dp)
-                .clip(RoundedCornerShape(12.dp))
-                .background(Color.White)
-                .border(1.dp, if (enabled && text.isNotBlank()) SaharaOrange else Color.LightGray, RoundedCornerShape(12.dp))
-        ) {
-            Icon(
-                Icons.Default.ArrowUpward,
-                contentDescription = "Send",
-                tint = if (enabled && text.isNotBlank()) SaharaOrange else Color.LightGray
-            )
         }
     }
 }

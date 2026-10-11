@@ -18,6 +18,10 @@ import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.coroutines.CancellationException
+import java.util.UUID
 import javax.inject.Inject
 import javax.inject.Singleton
 import com.sahara.user.data.model.ViewportState
@@ -50,7 +54,7 @@ class AgentApiClient @Inject constructor() {
             json(json)
         }
         install(Logging) {
-            level = LogLevel.BODY
+            level = LogLevel.NONE
             logger = object : Logger {
                 override fun log(message: String) {
                     Log.d(TAG, message)
@@ -65,12 +69,76 @@ class AgentApiClient @Inject constructor() {
         }
     }
     
-    private val baseUrl: String by lazy {
-        "${SecureConfig.getSupabaseUrl()}/functions/v1"
-    }
+    private val baseUrl: String get() = if (CommuteBackend.enabled) CommuteBackend.url else "${SecureConfig.getSupabaseUrl()}/functions/v1"
     
-    private val anonKey: String by lazy {
-        SecureConfig.getSupabaseAnonKey()
+    private fun HttpRequestBuilder.configureAuthentication(useCommute: Boolean = CommuteBackend.enabled) {
+        val key = if (useCommute) CommuteBackend.key else SecureConfig.getSupabaseAnonKey()
+        if (key.isNotBlank()) header("Authorization", "Bearer $key")
+        if (useCommute) header("X-Sahara-Session", CommuteBackend.session())
+        else header("apikey", key)
+    }
+
+    suspend fun checkServer(): String {
+        require(CommuteBackend.enabled) { "Configure your central server first" }
+        val response = client.get("$baseUrl/health")
+        check(response.status.isSuccess()) { "Server health check failed (${response.status.value})" }
+        val payload = json.parseToJsonElement(response.bodyAsText()).jsonObject
+        check(payload["status"]?.jsonPrimitive?.content == "ok") { "This address is not a Sahara server" }
+        val live = payload["live_enabled"]?.jsonPrimitive?.content == "true"
+        if (CommuteBackend.dataMode == "live") {
+            check(live) { "This server offers demo data only. Enable live access on the computer first." }
+            check(CommuteBackend.key.isNotBlank()) { "Enter your server access key in Server settings, then save and check the connection." }
+            val access = client.post("$baseUrl/v1/access/check") { configureAuthentication() }
+            check(access.status.isSuccess()) { "Server access key was not accepted" }
+        }
+        return if (CommuteBackend.dataMode == "live") "Connected. Live access enabled; source coverage is shown in results."
+            else "Connected for demo searches. Switch to Live web data and check your access key for live journeys."
+    }
+
+    suspend fun refreshSearch(searchId: String): ProcessQueryResponse {
+        require(CommuteBackend.enabled)
+        require(searchId.matches(Regex("[A-Za-z0-9_-]{1,100}")))
+        val response = client.get("$baseUrl/v1/searches/$searchId/response") { configureAuthentication() }
+        check(response.status.isSuccess()) { "Search update failed (${response.status.value})" }
+        return response.body()
+    }
+
+    suspend fun journeyGuidance(journeyId: String, progress: TripProgress? = null): JourneyGuidance {
+        require(CommuteBackend.enabled)
+        require(journeyId.matches(Regex("[A-Za-z0-9_-]{1,100}")))
+        val response = if (progress == null) client.get("$baseUrl/v1/journeys/$journeyId/guidance") { configureAuthentication() }
+        else client.post("$baseUrl/v1/journeys/$journeyId/progress") {
+            configureAuthentication()
+            contentType(ContentType.Application.Json)
+            setBody(progress)
+        }
+        if (!response.status.isSuccess() && progress != null && response.status.value in listOf(400,401,403,404,422))
+            throw TripConfirmationRejected("Travel status was not accepted (${response.status.value}). Check the departure time and confirm progress in order.")
+        check(response.status.isSuccess()) { "Journey update unavailable (${response.status.value}). Your confirmation will be checked again." }
+        val guidance = response.body<JourneyGuidance>()
+        check(guidance.journeyId == journeyId) { "Journey guidance did not match the selected route" }
+        return guidance
+    }
+
+    suspend fun revalidateJourney(journeyId: String) {
+        require(CommuteBackend.enabled)
+        require(journeyId.matches(Regex("[A-Za-z0-9_-]{1,100}")))
+        val response = client.post("$baseUrl/v1/journeys/$journeyId/revalidate") {
+            configureAuthentication()
+            contentType(ContentType.Application.Json)
+            setBody("{}")
+        }
+        check(response.status.isSuccess()) { "Journey sources could not be refreshed (${response.status.value})" }
+    }
+
+    suspend fun journeyMap(journeyId: String): JourneyMap {
+        require(CommuteBackend.enabled) { "Configure the central server to see the journey map" }
+        require(journeyId.matches(Regex("[A-Za-z0-9_-]{1,100}")))
+        val response = client.get("$baseUrl/v1/journeys/$journeyId/map") { configureAuthentication() }
+        check(response.status.isSuccess()) { "Journey map is unavailable (${response.status.value})" }
+        val map = response.body<JourneyMap>()
+        check(map.journeyId == journeyId) { "The map does not match this journey" }
+        return map
     }
     
     /**
@@ -171,13 +239,13 @@ class AgentApiClient @Inject constructor() {
                 query = query,
                 userLocation = if (latitude != null && longitude != null) {
                     UserLocation(latitude, longitude)
-                } else null
+                } else null,
+                dataMode = if (CommuteBackend.enabled) CommuteBackend.dataMode else "sample"
             )
             
             val response = client.post("$baseUrl/process-query") {
                 contentType(ContentType.Application.Json)
-                header("Authorization", "Bearer $anonKey")
-                header("apikey", anonKey)
+                configureAuthentication()
                 setBody(request)
             }
             
@@ -235,110 +303,68 @@ class AgentApiClient @Inject constructor() {
         query: String,
         latitude: Double? = null,
         longitude: Double? = null,
-        viewportState: ViewportState? = null
+        viewportState: ViewportState? = null,
+        resetContext: Boolean = false
     ): Flow<StreamEvent> = flow {
-        Log.d(TAG, "Streaming query: ${query.take(50)}... viewport=${viewportState != null}")
-        
         val request = ProcessQueryRequest(
             userId = userId,
             query = query,
-            userLocation = if (latitude != null && longitude != null) {
-                UserLocation(latitude, longitude)
-            } else null,
-            viewportState = viewportState
+            userLocation = if (latitude != null && longitude != null) UserLocation(latitude, longitude) else null,
+            viewportState = viewportState,
+            resetContext = resetContext,
+            dataMode = if (CommuteBackend.enabled) CommuteBackend.dataMode else "sample"
         )
-        
-        try {
-            val response = client.post("$baseUrl/process-query") {
-                contentType(ContentType.Application.Json)
-                header("Authorization", "Bearer $anonKey")
-                header("apikey", anonKey)
-                setBody(request)
+        fun decode(frame: String): StreamEvent? {
+            return try {
+                val event = json.decodeFromString<SSEEvent>(frame)
+                when (event.type) {
+                    "thinking" -> StreamEvent.Thinking(extractTextFromJsonElement(event.data))
+                    "reasoning" -> StreamEvent.Reasoning(extractTextFromJsonElement(event.data))
+                    "final_response" -> StreamEvent.FinalResponse(
+                        json.decodeFromJsonElement(ProcessQueryResponse.serializer(), event.data ?: return null)
+                    )
+                    "error" -> StreamEvent.Error(extractTextFromJsonElement(event.data).ifBlank { event.error ?: "Server error" })
+                    else -> null
+                }
+            } catch (error: Exception) {
+                StreamEvent.Error("Invalid response event: ${error.message}")
             }
-            
-            if (!response.status.isSuccess()) {
-                emit(StreamEvent.Error("Server error: ${response.status.value}"))
+        }
+        try {
+            if (CommuteBackend.enabled && CommuteBackend.dataMode == "live" && CommuteBackend.key.isBlank()) {
+                emit(StreamEvent.Error("Live searches need your server access key. Open Server settings, enter it, then save and check the connection."))
                 return@flow
             }
-            
-            // Get full response and split by SSE delimiter
-            // Handle both \n\n and \r\n\r\n line endings
-            val responseText = response.bodyAsText()
-            Log.d(TAG, "SSE Response length: ${responseText.length} chars")
-            Log.d(TAG, "SSE Response preview: ${responseText.take(500)}")
-            
-            // Normalize line endings and split by double newline
-            val normalizedText = responseText.replace("\r\n", "\n").replace("\r", "\n")
-            val events = normalizedText.split("\n\n").filter { it.isNotBlank() }
-            Log.d(TAG, "Found ${events.size} SSE events after normalization")
-            
-            if (events.isEmpty()) {
-                Log.w(TAG, "No SSE events found! Raw response: ${responseText.take(1000)}")
-                // Try parsing as single JSON response (non-SSE fallback)
-                try {
-                    val fallbackResponse = json.decodeFromString<ProcessQueryResponse>(responseText.trim())
-                    Log.d(TAG, "Parsed as direct JSON response (non-SSE)")
-                    emit(StreamEvent.FinalResponse(fallbackResponse))
-                    return@flow
-                } catch (e: Exception) {
-                    Log.e(TAG, "Failed to parse as direct JSON: ${e.message}")
-                }
-            }
-            
-            for ((index, eventStr) in events.withIndex()) {
-                val trimmed = eventStr.trim()
-                if (trimmed.isEmpty()) continue
-                
-                Log.d(TAG, "Event $index: ${trimmed.take(150)}")
-                
-                try {
-                    val event = json.decodeFromString<SSEEvent>(trimmed)
-                    Log.d(TAG, "Processing SSE event type: ${event.type}")
-                    
-                    when (event.type) {
-                        "reasoning" -> {
-                            // Extract text from JsonElement - it could be a JsonPrimitive string
-                            val text = extractTextFromJsonElement(event.data)
-                            if (text.isNotBlank()) {
-                                Log.d(TAG, ">>> EMITTING REASONING: $text")
-                                emit(StreamEvent.Reasoning(text))
-                            }
-                        }
-                        "thinking" -> {
-                            val text = extractTextFromJsonElement(event.data)
-                            if (text.isNotBlank()) {
-                                Log.d(TAG, ">>> EMITTING THINKING: $text")
-                                emit(StreamEvent.Thinking(text))
-                            }
-                        }
-                        "final_response" -> {
-                            val dataStr = event.data?.let { 
-                                json.encodeToString(JsonElement.serializer(), it)
-                            } ?: "{}"
-                            Log.d(TAG, "Parsing final_response: ${dataStr.take(200)}...")
-                            val finalResponse = json.decodeFromString<ProcessQueryResponse>(dataStr)
-                            emit(StreamEvent.FinalResponse(finalResponse))
-                        }
-                        "error" -> {
-                            val errorText = extractTextFromJsonElement(event.data)
-                            Log.e(TAG, "Server error event: $errorText")
-                            emit(StreamEvent.Error(errorText))
-                        }
-                        else -> {
-                            Log.w(TAG, "Unknown event type: ${event.type}")
-                        }
+            client.preparePost("$baseUrl/process-query") {
+                contentType(ContentType.Application.Json)
+                configureAuthentication()
+                setBody(request)
+            }.execute { response ->
+                if (!response.status.isSuccess()) {
+                    val message = when (response.status.value) {
+                        401, 403 -> "Your server access key was not accepted. Open Server settings and save the correct key."
+                        429 -> "Too many searches at once. Please wait a moment and try again."
+                        in 500..599 -> "The server could not complete this request. Please try again."
+                        else -> "The server rejected this request (${response.status.value}). Check your connection settings."
                     }
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed to parse event $index: ${trimmed.take(100)}, error: ${e.message}")
+                    emit(StreamEvent.Error(message))
+                    return@execute
                 }
+                val frames = EventFrames()
+                val channel = response.bodyAsChannel()
+                while (!channel.isClosedForRead) {
+                    val line = channel.readUTF8Line() ?: break
+                    frames.push(line)?.let { decode(it)?.let { event -> emit(event) } }
+                }
+                frames.finish()?.let { decode(it)?.let { event -> emit(event) } }
             }
-            
-        } catch (e: Exception) {
-            Log.e(TAG, "Streaming failed: ${e.message}", e)
-            emit(StreamEvent.Error(e.message ?: "Unknown error"))
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            emit(StreamEvent.Error(error.message ?: "Connection failed"))
         }
     }
-    
+
     /**
      * Helper to extract text from JsonElement - handles both primitive strings and complex objects
      */
@@ -367,7 +393,8 @@ class AgentApiClient @Inject constructor() {
     @Serializable
     private data class SSEEvent(
         val type: String,
-        val data: JsonElement? = null
+        val data: JsonElement? = null,
+        val error: String? = null
     )
     // ==================== TRACK BUS ====================
     
@@ -390,10 +417,9 @@ class AgentApiClient @Inject constructor() {
                 busName = busName
             )
             
-            val response = client.post("$baseUrl/track-bus") {
+            val response = client.post("${SecureConfig.getSupabaseUrl()}/functions/v1/track-bus") {
                 contentType(ContentType.Application.Json)
-                header("Authorization", "Bearer $anonKey")
-                header("apikey", anonKey)
+                configureAuthentication(useCommute = false)
                 setBody(request)
             }
             
@@ -436,10 +462,9 @@ class AgentApiClient @Inject constructor() {
                 radiusKm = radiusKm
             )
             
-            val response = client.post("$baseUrl/get-nearby-stops") {
+            val response = client.post("${SecureConfig.getSupabaseUrl()}/functions/v1/get-nearby-stops") {
                 contentType(ContentType.Application.Json)
-                header("Authorization", "Bearer $anonKey")
-                header("apikey", anonKey)
+                configureAuthentication(useCommute = false)
                 setBody(request)
             }
             
@@ -469,7 +494,9 @@ data class ProcessQueryRequest(
     val query: String,
     val userLocation: UserLocation? = null,
     // Map-Action Pipeline: Spatial context for AI reasoning
-    @SerialName("viewportState") val viewportState: ViewportState? = null
+    @SerialName("viewportState") val viewportState: ViewportState? = null,
+    val dataMode: String = "sample",
+    val resetContext: Boolean = false
 )
 
 @Serializable
@@ -495,7 +522,16 @@ data class ProcessQueryResponse(
     @SerialName("toolCalls") val toolCalls: List<com.sahara.user.data.model.AgentToolCall>? = null,
     // Map-Action Pipeline: AI-driven map commands (HIGHLIGHT_PATH, ZOOM_TO, etc.)
     @SerialName("map_commands") val mapCommands: List<MapCommand>? = null,
-    val error: String? = null
+    val error: String? = null,
+    val journeys: List<JourneyOption> = emptyList(),
+    val searchId: String? = null,
+    val dataMode: String? = null,
+    val collectionComplete: Boolean = true,
+    val pendingProviders: List<String> = emptyList(),
+    val providers: List<SourceStatus> = emptyList(),
+    val placeNames: Map<String, String> = emptyMap(),
+    val coverage: String? = null,
+    val collectionError: String? = null
 )
 
 /**

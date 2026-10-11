@@ -36,14 +36,22 @@ android {
         val perplexityKey = properties.getProperty("PERPLEXITY_API_KEY", "")
         val supabaseUrl = properties.getProperty("SUPABASE_URL", "")
         val supabaseKey = properties.getProperty("SUPABASE_ANON_KEY", "")
+        val commuteUrl = properties.getProperty("COMMUTE_BACKEND_URL", "").trimEnd('/')
+        val commuteKey = properties.getProperty("COMMUTE_API_KEY", "")
+        val commuteMode = properties.getProperty("COMMUTE_DATA_MODE", "sample")
 
         buildConfigField("String", "PERPLEXITY_API_KEY", "\"${perplexityKey}\"")
         buildConfigField("String", "SUPABASE_URL", "\"${supabaseUrl}\"")
         buildConfigField("String", "SUPABASE_ANON_KEY", "\"${supabaseKey}\"")
+        buildConfigField("String", "COMMUTE_BACKEND_URL", "\"${commuteUrl}\"")
+        buildConfigField("String", "COMMUTE_API_KEY", "\"${commuteKey}\"")
+        buildConfigField("String", "COMMUTE_DATA_MODE", "\"${commuteMode}\"")
     }
 
     buildTypes {
         release {
+            // Shared development gateway credentials must never enter a release APK.
+            buildConfigField("String", "COMMUTE_API_KEY", "\"\"")
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(

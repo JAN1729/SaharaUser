@@ -1,160 +1,63 @@
 package com.sahara.user.ui.screens
 
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.LocalOffer
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.viewinterop.AndroidView
 import androidx.hilt.navigation.compose.hiltViewModel
-import com.sahara.user.ui.components.LiquidGlassCard
-import com.sahara.user.ui.components.SaharaSearchBar
-import com.sahara.user.ui.components.SaharaTopBar
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.sahara.user.data.api.CommuteBackend
+import com.sahara.user.ui.components.JourneyComposer
+import com.sahara.user.ui.components.ChatGray
+import com.sahara.user.ui.components.ChatBorder
 import com.sahara.user.ui.viewmodel.ChatViewModel
-import org.osmdroid.config.Configuration
-import org.osmdroid.tileprovider.tilesource.TileSourceFactory
-import org.osmdroid.util.GeoPoint
-import org.osmdroid.views.MapView
-import org.osmdroid.views.overlay.Marker
-import kotlinx.coroutines.launch
 
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
-fun HomeScreen(
-    onNavigateToProfile: () -> Unit,
-    onNavigateToChat: () -> Unit,
-    viewModel: ChatViewModel = hiltViewModel()
-) {
-    val context = LocalContext.current
-    var searchQuery by remember { mutableStateOf("") }
-    
-    // Observables
-    val messages by viewModel.messages.collectAsState()
-    val isLoading by viewModel.isLoading.collectAsState()
-    val userLocation by viewModel.userLocation.collectAsState()
-    
-    // State
-    val listState = rememberLazyListState()
-    val coroutineScope = rememberCoroutineScope()
-    
-    // Permission Launcher
-    val locationPermissionLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestMultiplePermissions()
-    ) { permissions ->
-        if (permissions.values.all { it }) {
-            viewModel.onLocationPermissionGranted()
-        }
-    }
-
-    // Initialize OSM Configuration & Request Permission
-    LaunchedEffect(Unit) {
-        Configuration.getInstance().load(context, context.getSharedPreferences("osmdroid", 0))
-        locationPermissionLauncher.launch(
-            arrayOf(
-                android.Manifest.permission.ACCESS_FINE_LOCATION,
-                android.Manifest.permission.ACCESS_COARSE_LOCATION
-            )
-        )
-    }
-    
-    // Auto-scroll to bottom of chat
-    LaunchedEffect(messages.size) {
-        if (messages.isNotEmpty()) {
-            listState.animateScrollToItem(messages.size - 1)
-        }
-    }
-
-    Scaffold(
-        containerColor = MaterialTheme.colorScheme.background,
-        modifier = Modifier.systemBarsPadding() // FIX: Status Bar Collision
+fun HomeScreen(onNavigateToSettings: () -> Unit, onNavigateToChat: () -> Unit,
+               viewModel: ChatViewModel = hiltViewModel()) {
+    var query by rememberSaveable { mutableStateOf("") }
+    val loading by viewModel.isLoading.collectAsStateWithLifecycle()
+    val messages by viewModel.messages.collectAsStateWithLifecycle()
+    val version by viewModel.connectionVersion.collectAsStateWithLifecycle()
+    val mode = remember(version) { CommuteBackend.dataMode }
+    fun submit() { if (viewModel.sendMessage(query.trim())) { query = ""; onNavigateToChat() } }
+    Scaffold(modifier = Modifier.systemBarsPadding().imePadding(), containerColor = MaterialTheme.colorScheme.background,
+        topBar = { TopAppBar(title = { Text("Sahara", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold) },
+            colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background),
+            actions = { IconButton(onClick = onNavigateToSettings) { Icon(Icons.Default.Settings, "Server settings") } }) },
+        bottomBar = { JourneyComposer(query, { query = it }, { submit() }, !loading) }
     ) { padding ->
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(padding)
-        ) {
-            
-            // 1. Top Bar (Logo moved down a bit via Spacer)
-            Spacer(modifier = Modifier.height(24.dp)) // Push Logo down
-            SaharaTopBar(
-                onMenuClick = { /* TODO */ },
-                onProfileClick = onNavigateToProfile
-            )
-            
-            // 2. Middle Section (Search Bar Centered)
-            Box(
-                modifier = Modifier
-                    .weight(1f) // Takes all available space between Top and Map
-                    .fillMaxWidth(),
-                contentAlignment = Alignment.Center // Strictly center the search bar
-            ) {
-                SaharaSearchBar(
-                    query = searchQuery,
-                    onQueryChange = { searchQuery = it },
-                    onSearch = {
-                        if (searchQuery.isNotBlank()) {
-                            viewModel.sendMessage(searchQuery)
-                            searchQuery = ""
-                            onNavigateToChat() // Navigate to Thinking/Chat screen
-                        }
-                    },
-                    placeholder = "Where do you want to go?",
-                    modifier = Modifier.padding(horizontal = 24.dp)
-                )
+        Column(Modifier.fillMaxSize().padding(padding).verticalScroll(rememberScrollState()).padding(horizontal = 24.dp),
+            verticalArrangement = Arrangement.spacedBy(18.dp)) {
+            Spacer(Modifier.height(64.dp))
+            Text("Where are we heading?", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+            Text("Tell me your journey. I’ll find the connections.", style = MaterialTheme.typography.bodyLarge)
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                SuggestionChip(onClick = { query = "Kottayam to Bengaluru tomorrow, arrive before 8 pm" }, label = { Text("Arrive before evening") },
+                    icon = { Icon(Icons.Default.Search, null, Modifier.size(18.dp)) }, shape = RoundedCornerShape(24.dp),
+                    border = BorderStroke(1.dp, ChatBorder), colors = SuggestionChipDefaults.suggestionChipColors(containerColor = ChatGray))
+                SuggestionChip(onClick = { query = "Kottayam to Bengaluru tomorrow, find the lowest fare" }, label = { Text("Find the lowest fare") },
+                    icon = { Icon(Icons.Default.LocalOffer, null, Modifier.size(18.dp)) }, shape = RoundedCornerShape(24.dp),
+                    border = BorderStroke(1.dp, ChatBorder), colors = SuggestionChipDefaults.suggestionChipColors(containerColor = ChatGray))
             }
-            
-            // 3. Map Container (Bottom, reduced height)
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(280.dp) // Slight adjust to "move up" visually (taller or just positioned?) 
-                                    // User said "move the map a bit up". If it's bottom anchored, making it taller moves it up.
-                                    // Or maybe they meant padding? I'll keep it distinct.
-                    .padding(horizontal = 16.dp)
-                    .padding(bottom = 32.dp) // Layout "perfect" usually implies breathing room
-            ) {
-                LiquidGlassCard(
-                    modifier = Modifier.fillMaxSize(),
-                    shape = RoundedCornerShape(32.dp)
-                ) {
-                    AndroidView(
-                        modifier = Modifier.fillMaxSize(),
-                        factory = { ctx ->
-                            MapView(ctx).apply {
-                                setTileSource(TileSourceFactory.MAPNIK)
-                                setMultiTouchControls(true)
-                                controller.setZoom(15.0)
-                                if (userLocation != null) {
-                                    controller.setCenter(GeoPoint(userLocation!!.latitude, userLocation!!.longitude))
-                                } else {
-                                    controller.setCenter(GeoPoint(12.9716, 77.5946))
-                                }
-                                isTilesScaledToDpi = true
-                            }
-                        },
-                        update = { mapView ->
-                            userLocation?.let { loc ->
-                                val geoPoint = GeoPoint(loc.latitude, loc.longitude)
-                                mapView.controller.animateTo(geoPoint)
-                                mapView.overlays.clear()
-                                val marker = Marker(mapView)
-                                marker.position = geoPoint
-                                marker.setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
-                                marker.title = "Me"
-                                mapView.overlays.add(marker)
-                            }
-                        }
-                    )
-                }
-            }
+            Text(if (mode == "sample") "Demo mode · illustrative journeys" else "Web sources · checked during your search",
+                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("Try “Kottayam to Bengaluru tomorrow”. Add a budget or arrival time to help me compare.",
+                style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            if (messages.isNotEmpty()) TextButton(onClick = onNavigateToChat) { Text("Return to your journey") }
+            Spacer(Modifier.height(24.dp))
         }
     }
 }

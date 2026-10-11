@@ -62,3 +62,29 @@ google-services.json
 *.tmp
 *.temp
 *.bak
+
+# Independent reference checkout and local Python runtime data
+/references/
+/backend/data/
+/data/
+/builds/
+/backend/build/
+/backend/*.egg-info/
+/visaguy_mcp/build/
+/visaguy_mcp/dist/
+/visaguy_mcp/*.egg-info/
+dist/
+build/
+*.egg-info/
+*.egg
+!/backend/.env.example
+!/backend/tests/fixtures/*.json
+/backend/.venv/
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Local screenshot dumps
+screen.png
